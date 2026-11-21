@@ -1,0 +1,118 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.10"
+          cache: true
+      - name: Verify formatting
+        shell: bash
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "Go files need formatting:"
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+      - name: Verify modules
+        run: go mod verify
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...
+      - name: Race test
+        if: runner.os == 'Linux'
+        run: go test -race ./...
+      - name: Build
+        run: go build ./cmd/wazzapagent
+      - name: Install govulncheck
+        if: runner.os == 'Linux'
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+      - name: Vulnerability scan
+        if: runner.os == 'Linux'
+        run: govulncheck ./...
+
+  # The browser server and the frontend sit behind the web build tag and need
+  # the built bundle, so the quality job above never compiles them.
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.10"
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.19.0'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Typecheck frontend
+        working-directory: frontend
+        run: npm run typecheck
+      - name: Build browser bundle
+        working-directory: frontend
+        run: npm run build:web
+      - name: Vet web build
+        run: go vet -tags web ./...
+      - name: Build web server
+        run: go build -tags web ./cmd/server
+      - name: Build web host
+        run: go build -tags web ./cmd/webhost
+      - name: Cross-build web host for Debian
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          GOOS=linux GOARCH=amd64 go build -tags web -o /dev/null ./cmd/webhost
+          GOOS=linux GOARCH=arm64 go build -tags web -o /dev/null ./cmd/webhost
+
+  cross-build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          # gen2brain/webp loads a system libwebp through purego, which
+          # needs cgo on Android; nodynamic keeps its pure-Go encoder only.
+          # The APK build (app.yml) uses cgo and needs no tag.
+          - goos: android
+            goarch: arm64
+            tags: nodynamic
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.10"
+          cache: true
+      - name: Cross-build
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -tags "${{ matrix.tags }}" ./cmd/wazzapagent

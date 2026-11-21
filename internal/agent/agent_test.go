@@ -1,0 +1,645 @@
+package agent_test
+
+import (
+	"context"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	appsqlite "github.com/Chomosuke9/WazzapAgent-Go/internal/adapters/sqlite"
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/agent"
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/effect"
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/identity"
+)
+
+func TestAgentInvokePersistsPlanAndSkipsModelOnReplay(t *testing.T) {
+	store := openStore(t)
+	model := &fakeModel{text: "model reply"}
+	dispatcher := &fakeDispatcher{}
+	key := newKey(t)
+	current := newAgent(t, key, store, model, dispatcher)
+	invocation := newInvocation(t, agent.InitialConfigVersion, "hello")
+
+	first, err := current.Invoke(context.Background(), invocation)
+	if err != nil {
+		t.Fatalf("first invoke: %v", err)
+	}
+	second, err := current.Invoke(context.Background(), invocation)
+	if err != nil {
+		t.Fatalf("replay invoke: %v", err)
+	}
+	if first.ActionID != second.ActionID || first.ResponseID != second.ResponseID || first.Text != second.Text {
+		t.Fatalf("replay created a different plan: first=%#v second=%#v", first, second)
+	}
+	if model.calls.Load() != 1 {
+		t.Fatalf("model calls = %d, want 1", model.calls.Load())
+	}
+	if dispatcher.calls.Load() != 2 {
+		t.Fatalf("dispatcher observations = %d, want 2", dispatcher.calls.Load())
+	}
+
+}
+
+func TestInvokeWithReusesObservedMetadata(t *testing.T) {
+	store := openStore(t)
+	key := newKey(t)
+	reader := &countingChatContextReader{}
+	deps := dependencies(store, &fakeModel{text: "reply"}, &fakeDispatcher{})
+	deps.ChatContext = reader
+	current, err := agent.New(context.Background(), key, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invocation := newInvocation(t, agent.InitialConfigVersion, "hello")
+	if _, err := current.InvokeWith(context.Background(), invocation, snapshotOf(t, current), &agent.ChatContext{Kind: "group", Name: "Group"}); err != nil {
+		t.Fatal(err)
+	}
+	if reader.calls != 0 {
+		t.Fatalf("chat context reads = %d, want 0", reader.calls)
+	}
+}
+
+func TestAgentAtomicallyPlansAndDispatchesGrantedTypedEffect(t *testing.T) {
+	store := openStore(t)
+	model := &currentReactionModel{}
+	responses := &fakeDispatcher{}
+	effects := &fakeEffectDispatcher{}
+	key := newKey(t)
+	deps := dependencies(store, model, responses)
+	deps.Effects = effects
+	current, err := agent.New(context.Background(), key, deps)
+	if err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+	invocation := newInvocation(t, agent.InitialConfigVersion, "react please")
+	invocation.Capabilities, _ = agent.NewCapabilitySet("message.react")
+	if _, err := current.Invoke(context.Background(), invocation); err != nil {
+		t.Fatalf("invoke typed effect: %v", err)
+	}
+	if effects.calls.Load() != 1 {
+		t.Fatalf("effect dispatch calls = %d, want 1", effects.calls.Load())
+	}
+	record, err := store.Turns().Load(context.Background(), key, invocation.ID)
+	if err != nil || record.Plan == nil || len(record.Plan.Effects) != 1 || effects.last != record.Plan.Effects[0] {
+		t.Fatalf("atomic stored effect plan = %#v, last=%#v, err=%v", record.Plan, effects.last, err)
+	}
+}
+
+func TestAgentReactionOnlyHasNoTextActionAndReplaysDurably(t *testing.T) {
+	store := openStore(t)
+	model := &reactionOnlyModel{}
+	responses := &fakeDispatcher{}
+	effects := &fakeEffectDispatcher{}
+	key := newKey(t)
+	deps := dependencies(store, model, responses)
+	deps.Effects = effects
+	current, err := agent.New(context.Background(), key, deps)
+	if err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+	invocation := newInvocation(t, agent.InitialConfigVersion, "react please")
+	invocation.Capabilities, _ = agent.NewCapabilitySet("message.react")
+	first, err := current.Invoke(context.Background(), invocation)
+	if err != nil {
+		t.Fatalf("invoke reaction-only turn: %v", err)
+	}
+	if first.Text != "" || !first.ActionID.IsZero() || !first.ResponseID.IsZero() || first.Delivery != agent.DeliverySucceeded ||
+		responses.calls.Load() != 0 || effects.calls.Load() != 1 {
+		t.Fatalf("reaction-only result = %#v, text sends=%d, effects=%d", first, responses.calls.Load(), effects.calls.Load())
+	}
+	record, err := store.Turns().Load(context.Background(), key, invocation.ID)
+	if err != nil || record.Plan == nil || record.State != agent.TurnSucceeded || len(record.Plan.Effects) != 1 {
+		t.Fatalf("durable reaction-only plan = %#v, err=%v", record, err)
+	}
+	actions, err := store.Actions().ListPending(context.Background(), key.TenantID, time.Time{})
+	if err != nil || len(actions) != 0 {
+		t.Fatalf("reaction-only outbound text actions = %#v, err=%v", actions, err)
+	}
+	history, err := current.History().List(context.Background(), agent.InitialConfigVersion, agent.HistoryQuery{Limit: 10})
+	if err != nil || len(history.Entries) != 1 || history.Entries[0].Role != agent.HistoryUser {
+		t.Fatalf("reaction-only history = %#v, err=%v", history, err)
+	}
+	recoverable, err := store.Effects().ListPending(context.Background(), key.TenantID, time.Time{})
+	if err != nil || len(recoverable) != 1 || recoverable[0].EffectID != record.Plan.Effects[0].EffectID {
+		t.Fatalf("recoverable reaction = %#v, err=%v", recoverable, err)
+	}
+	if err := store.Effects().Start(context.Background(), effect.Ref{Key: key, EffectID: record.Plan.Effects[0].EffectID}, time.Now().UTC()); err != nil {
+		t.Fatalf("reaction-only effect start: %v", err)
+	}
+	second, err := current.Invoke(context.Background(), invocation)
+	if err != nil || second.Delivery != agent.DeliverySucceeded || model.calls.Load() != 1 || responses.calls.Load() != 0 {
+		t.Fatalf("reaction-only replay = %#v, model=%d, sends=%d, err=%v", second, model.calls.Load(), responses.calls.Load(), err)
+	}
+}
+
+func TestAgentRejectsModelEffectRedirectedToAnotherMessage(t *testing.T) {
+	store := openStore(t)
+	redirected, _ := identity.NewMessageID()
+	model := &redirectedReactionModel{target: redirected}
+	key := newKey(t)
+	current, err := agent.New(context.Background(), key, dependencies(store, model, &fakeDispatcher{}))
+	if err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+	invocation := newInvocation(t, agent.InitialConfigVersion, "react another")
+	invocation.Capabilities, _ = agent.NewCapabilitySet("message.react")
+	if _, err := current.Invoke(context.Background(), invocation); !agent.IsCode(err, agent.ErrorProviderFailure) {
+		t.Fatalf("redirected model effect error = %v, want provider_failure", err)
+	}
+}
+
+func TestAgentCapturesConfigVersionAndRejectsStalePolicy(t *testing.T) {
+	store := openStore(t)
+	model := &blockingModel{started: make(chan agent.ModelRequest, 1), release: make(chan struct{})}
+	dispatcher := &fakeDispatcher{}
+	key := newKey(t)
+	current := newAgent(t, key, store, model, dispatcher)
+	invocation := newInvocation(t, agent.InitialConfigVersion, "first")
+	result := make(chan error, 1)
+	go func() {
+		_, err := current.Invoke(context.Background(), invocation)
+		result <- err
+	}()
+	request := <-model.started
+	if request.ConfigVersion != agent.InitialConfigVersion || len(request.Messages) < 2 ||
+		request.Messages[0].AdditionalPrompt != "base prompt" ||
+		request.Messages[len(request.Messages)-1].Provenance != agent.ProvenanceHistoryTranscript {
+		t.Fatalf("captured model request = %#v", request)
+	}
+	updated, err := current.Config().SetPromptOverride(context.Background(), agent.InitialConfigVersion, agent.PromptOverride{Mode: agent.PromptAppend, Text: "new override"})
+	if err != nil {
+		t.Fatalf("update config during invoke: %v", err)
+	}
+	close(model.release)
+	if err := <-result; err != nil {
+		t.Fatalf("invoke after concurrent config update: %v", err)
+	}
+	record, err := store.Turns().Load(context.Background(), key, invocation.ID)
+	if err != nil {
+		t.Fatalf("load turn: %v", err)
+	}
+	if record.Plan.ConfigVersion != agent.InitialConfigVersion {
+		t.Fatalf("plan config version = %d, want original version", record.Plan.ConfigVersion)
+	}
+	if updated.Version != 2 {
+		t.Fatalf("config update version = %d", updated.Version)
+	}
+
+	stale := newInvocation(t, agent.InitialConfigVersion, "stale")
+	if _, err := current.Invoke(context.Background(), stale); !agent.IsCode(err, agent.ErrorConflict) {
+		t.Fatalf("stale policy error = %v, want conflict", err)
+	}
+	if model.callCount.Load() != 1 {
+		t.Fatalf("stale policy reached model; calls=%d", model.callCount.Load())
+	}
+}
+
+func TestHistoryResetCancelsInFlightTurnWithoutWaitingForModel(t *testing.T) {
+	store := openStore(t)
+	model := &blockingModel{started: make(chan agent.ModelRequest, 1), release: make(chan struct{})}
+	current := newAgent(t, newKey(t), store, model, &fakeDispatcher{})
+	invokeDone := make(chan error, 1)
+	go func() {
+		_, err := current.Invoke(context.Background(), newInvocation(t, agent.InitialConfigVersion, "in flight"))
+		invokeDone <- err
+	}()
+	<-model.started
+	resetCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := current.History().Reset(resetCtx, agent.InitialConfigVersion); err != nil {
+		t.Fatalf("reset while invoke is active: %v", err)
+	}
+	close(model.release)
+	if err := <-invokeDone; !agent.IsCode(err, agent.ErrorConflict) {
+		t.Fatalf("late invoke error = %v, want conflict", err)
+	}
+	page, err := current.History().List(context.Background(), agent.InitialConfigVersion, agent.HistoryQuery{Limit: 10})
+	if err != nil || len(page.Entries) != 0 {
+		t.Fatalf("history after reset = %#v, err=%v", page, err)
+	}
+}
+
+func TestAgentInvokeSerializesOneChat(t *testing.T) {
+	store := openStore(t)
+	model := &trackingModel{delay: 15 * time.Millisecond}
+	current := newAgent(t, newKey(t), store, model, &fakeDispatcher{})
+	var wait sync.WaitGroup
+	for index := 0; index < 6; index++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			invocation := newInvocation(t, agent.InitialConfigVersion, "message")
+			if _, err := current.Invoke(context.Background(), invocation); err != nil {
+				t.Errorf("invoke %d: %v", index, err)
+			}
+		}(index)
+	}
+	wait.Wait()
+	if model.maximum.Load() != 1 {
+		t.Fatalf("maximum concurrent model calls = %d, want 1", model.maximum.Load())
+	}
+}
+
+func TestDifferentChatAgentsInvokeConcurrently(t *testing.T) {
+	store := openStore(t)
+	model := &trackingModel{waitFor: 2}
+	first := newAgent(t, newKey(t), store, model, &fakeDispatcher{})
+	second := newAgent(t, newKey(t), store, model, &fakeDispatcher{})
+	var wait sync.WaitGroup
+	for _, current := range []*agent.Agent{first, second} {
+		wait.Add(1)
+		go func(current *agent.Agent) {
+			defer wait.Done()
+			if _, err := current.Invoke(context.Background(), newInvocation(t, agent.InitialConfigVersion, "message")); err != nil {
+				t.Errorf("invoke different chat: %v", err)
+			}
+		}(current)
+	}
+	wait.Wait()
+	if model.maximum.Load() != 2 {
+		t.Fatalf("maximum cross-chat model calls = %d, want 2", model.maximum.Load())
+	}
+}
+
+func TestConfigReadsSeeOtherWriters(t *testing.T) {
+	store := openStore(t)
+	key := newKey(t)
+	first := newAgent(t, key, store, &fakeModel{text: "reply"}, &fakeDispatcher{})
+	second := newAgent(t, key, store, &fakeModel{text: "reply"}, &fakeDispatcher{})
+	updated, err := first.Config().SetPromptOverride(context.Background(), agent.InitialConfigVersion, agent.PromptOverride{
+		Mode: agent.PromptAppend, Text: "durable change",
+	})
+	if err != nil {
+		t.Fatalf("mutate first config: %v", err)
+	}
+	refreshed, err := second.Config().Refresh(context.Background())
+	if err != nil {
+		t.Fatalf("refresh second config: %v", err)
+	}
+	if refreshed.Version != updated.Version || refreshed.PromptOverride == nil || refreshed.PromptOverride.Text != "durable change" {
+		t.Fatalf("refreshed config = %#v", refreshed)
+	}
+}
+
+func TestAgentRejectsInvalidModelOutputBeforeDispatch(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+	}{
+		{name: "empty", text: ""},
+		{name: "whitespace", text: "   "},
+		{name: "invalid UTF-8", text: string([]byte{0xff})},
+		{name: "oversized", text: strings.Repeat("x", agent.MaxResponseBytes+1)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := openStore(t)
+			dispatcher := &fakeDispatcher{}
+			current := newAgent(t, newKey(t), store, &fakeModel{text: test.text}, dispatcher)
+			_, err := current.Invoke(context.Background(), newInvocation(t, agent.InitialConfigVersion, "message"))
+			if !agent.IsCode(err, agent.ErrorProviderFailure) {
+				t.Fatalf("invalid model result error = %v, want provider_failure", err)
+			}
+			if dispatcher.calls.Load() != 0 {
+				t.Fatalf("invalid model result reached dispatcher %d times", dispatcher.calls.Load())
+			}
+		})
+	}
+}
+
+func TestAgentPreservesDispatcherFailureBeforeActionObservation(t *testing.T) {
+	store := openStore(t)
+	dispatchErr := agent.NewError(agent.ErrorStorageFailure, "load action", context.DeadlineExceeded)
+	current := newAgent(t, newKey(t), store, &fakeModel{text: "reply"}, failingDispatcher{err: dispatchErr})
+	result, err := current.Invoke(context.Background(), newInvocation(t, agent.InitialConfigVersion, "message"))
+	if !agent.IsCode(err, agent.ErrorStorageFailure) {
+		t.Fatalf("dispatcher error = %v, want storage_failure", err)
+	}
+	if result.ActionID.IsZero() || result.Delivery != agent.DeliveryPending {
+		t.Fatalf("planned result was lost: %#v", result)
+	}
+}
+
+func TestRegistryReturnsOneAgentPerChat(t *testing.T) {
+	store := openStore(t)
+	var constructions atomic.Int32
+	factory := agent.FactoryFunc(func(ctx context.Context, key agent.Key) (*agent.Agent, error) {
+		constructions.Add(1)
+		return agent.New(ctx, key, dependencies(store, &fakeModel{text: "ok"}, &fakeDispatcher{}))
+	})
+	registry, err := agent.NewRegistry(factory)
+	if err != nil {
+		t.Fatalf("create registry: %v", err)
+	}
+	key := newKey(t)
+	agents := make(chan *agent.Agent, 8)
+	var wait sync.WaitGroup
+	for range 8 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			value, err := registry.AgentFor(context.Background(), key)
+			if err != nil {
+				t.Errorf("get agent: %v", err)
+			}
+			agents <- value
+		}()
+	}
+	wait.Wait()
+	close(agents)
+	first := <-agents
+	for value := range agents {
+		if value != first {
+			t.Fatal("registry returned two agents for one chat")
+		}
+	}
+	other, err := registry.AgentFor(context.Background(), newKey(t))
+	if err != nil || other == first {
+		t.Fatalf("other chat agent = %p, %v", other, err)
+	}
+}
+
+func TestOnlyCurrentMessagesSendTheirImagesToTheModel(t *testing.T) {
+	store := openStore(t)
+	model := &imageModel{}
+	key := newKey(t)
+	deps := dependencies(store, model, sentDispatcher{store: store})
+	reader := &fakeImages{}
+	deps.Images = reader
+	current, err := agent.New(context.Background(), key, deps)
+	if err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+
+	if _, err := current.Invoke(context.Background(), newInvocation(t, agent.InitialConfigVersion, "【image】 what is this?")); err != nil {
+		t.Fatalf("image invoke: %v", err)
+	}
+	if len(model.images) != 1 || len(model.images[0]) != 1 {
+		t.Fatalf("images on the image turn = %#v", model.images)
+	}
+	image := model.images[0][0]
+	if image.Mime != "image/jpeg" || string(image.Data) != "jpeg" || !strings.HasPrefix(image.Label, "Image of message 【#") {
+		t.Fatalf("image = %#v", image)
+	}
+
+	// The image is now in an older message: the bot replied after it.
+	if _, err := current.Invoke(context.Background(), newInvocation(t, agent.InitialConfigVersion, "and now?")); err != nil {
+		t.Fatalf("follow-up invoke: %v", err)
+	}
+	if len(model.images) != 2 || len(model.images[1]) != 0 || reader.calls != 1 {
+		t.Fatalf("images on the follow-up turn = %#v, reads = %d", model.images, reader.calls)
+	}
+}
+
+func TestSubagentResultImagesReachTheModel(t *testing.T) {
+	store := openStore(t)
+	model := &imageModel{}
+	current := newAgent(t, newKey(t), store, model, &fakeDispatcher{})
+	invocation := newInvocation(t, agent.InitialConfigVersion, "【SUBTASK FINISHED】")
+	invocation.Sender = nil
+	invocation.Cause = agent.CauseSubagentResult
+	invocation.Causation.Kind = agent.CausationSubagent
+	chat := agent.ChatContext{Kind: "private", Subagent: &agent.SubagentContext{
+		Result:       "result",
+		ResultImages: []agent.ModelImage{{Label: "Sub-agent output file chart.png:", Mime: "image/png", Data: []byte("png")}},
+	}}
+	if _, err := current.InvokeWith(context.Background(), invocation, snapshotOf(t, current), &chat); err != nil {
+		t.Fatalf("result invoke: %v", err)
+	}
+	if len(model.images) != 1 || len(model.images[0]) != 1 || model.images[0][0].Label != "Sub-agent output file chart.png:" {
+		t.Fatalf("images = %#v", model.images)
+	}
+}
+
+type imageModel struct{ images [][]agent.ModelImage }
+
+func (model *imageModel) Generate(_ context.Context, request agent.ModelRequest) (agent.ModelResult, error) {
+	model.images = append(model.images, request.Images)
+	return agent.ModelResult{Text: "reply"}, nil
+}
+
+// sentDispatcher records every reply as sent, so it ends the burst it answers.
+type sentDispatcher struct{ store *appsqlite.Store }
+
+func (dispatcher sentDispatcher) Dispatch(ctx context.Context, ref agent.DispatchRef) (agent.DeliveryResult, error) {
+	now := time.Now().UTC()
+	if err := dispatcher.store.Actions().Start(ctx, ref, now); err != nil {
+		return agent.DeliveryResult{}, err
+	}
+	if err := dispatcher.store.Actions().Complete(ctx, ref, ref.ActionID.String(), now); err != nil {
+		return agent.DeliveryResult{}, err
+	}
+	return agent.DeliveryResult{ActionID: ref.ActionID, Status: agent.DeliverySucceeded}, nil
+}
+
+type fakeImages struct{ calls int }
+
+func (reader *fakeImages) MessageImage(context.Context, agent.Key, identity.MessageID) (string, []byte, error) {
+	reader.calls++
+	return "image/jpeg", []byte("jpeg"), nil
+}
+
+func openStore(t *testing.T) *appsqlite.Store {
+	t.Helper()
+	store, err := appsqlite.Open(context.Background(), filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
+}
+
+func newAgent(
+	t *testing.T,
+	key agent.Key,
+	store *appsqlite.Store,
+	model agent.ModelInvoker,
+	dispatcher agent.ResponseDispatcher,
+) *agent.Agent {
+	t.Helper()
+	value, err := agent.New(context.Background(), key, dependencies(store, model, dispatcher))
+	if err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+	return value
+}
+
+func dependencies(store *appsqlite.Store, model agent.ModelInvoker, dispatcher agent.ResponseDispatcher) agent.Dependencies {
+	providerID, _ := identity.ParseProviderID("openai-compatible")
+	policyID, _ := identity.ParsePolicyID("part1-chat-gate.v1")
+	contextBuilder, _ := agent.NewDeterministicContextBuilder(agent.DefaultMaxContextBytes, "Vivy")
+	return agent.Dependencies{
+		Defaults: agent.ConfigValues{
+			Model:      agent.ModelConfig{ProviderID: providerID, Model: "test-model", MaxOutputTokens: 256},
+			Prompt:     "base prompt",
+			Permission: agent.PermissionConfig{PolicyID: policyID, Revision: 1},
+		},
+		ConfigStore:   store.Configs(),
+		HistoryStore:  store.History(),
+		Turns:         store.Turns(),
+		Context:       contextBuilder,
+		ChatContext:   staticChatContextReader{},
+		HistoryWindow: agent.DefaultHistoryWindow,
+		Model:         model,
+		Responses:     dispatcher,
+		Clock:         agent.SystemClock{},
+	}
+}
+
+type staticChatContextReader struct{}
+
+type countingChatContextReader struct{ calls int }
+
+func (reader *countingChatContextReader) ReadChatContext(context.Context, agent.Key) (agent.ChatContext, error) {
+	reader.calls++
+	return agent.ChatContext{Kind: "private"}, nil
+}
+
+func (staticChatContextReader) ReadChatContext(context.Context, agent.Key) (agent.ChatContext, error) {
+	return agent.ChatContext{Kind: "private"}, nil
+}
+
+func newKey(t *testing.T) agent.Key {
+	t.Helper()
+	tenantID, _ := identity.NewTenantID()
+	accountID, _ := identity.NewAccountID()
+	chatID, _ := identity.NewChatID()
+	return agent.Key{TenantID: tenantID, AccountID: accountID, ChatID: chatID}
+}
+
+func newInvocation(t *testing.T, version agent.ConfigVersion, text string) agent.Invocation {
+	t.Helper()
+	invocationID, _ := identity.NewInvocationID()
+	causationID, _ := identity.NewCausationID()
+	participantID, _ := identity.NewParticipantID()
+	senderRef, _ := identity.NewSenderRef()
+	capabilities, _ := agent.NewCapabilitySet()
+	return agent.Invocation{
+		ID:            invocationID,
+		Causation:     agent.CausationRef{Kind: agent.CausationMessage, ID: causationID},
+		Cause:         agent.CauseInboundMessage,
+		Sender:        &agent.SenderContext{ParticipantID: participantID, Ref: senderRef, DisplayName: "Tester"},
+		Input:         []agent.ContentPart{agent.TextPart{Text: text}},
+		Capabilities:  capabilities,
+		PolicyVersion: version,
+		RequestedAt:   time.Now().UTC(),
+	}
+}
+
+type fakeModel struct {
+	text  string
+	calls atomic.Int32
+}
+
+type currentReactionModel struct{ calls atomic.Int32 }
+
+type reactionOnlyModel struct{ calls atomic.Int32 }
+
+func (model *reactionOnlyModel) Generate(_ context.Context, request agent.ModelRequest) (agent.ModelResult, error) {
+	model.calls.Add(1)
+	return agent.ModelResult{Effects: []agent.ModelEffect{{
+		CallID: "call_react", Intent: agent.EffectIntent{Kind: agent.EffectReact, TargetMessageID: request.CurrentMessageID, Emoji: "👍"},
+	}}}, nil
+}
+
+func (model *currentReactionModel) Generate(_ context.Context, request agent.ModelRequest) (agent.ModelResult, error) {
+	model.calls.Add(1)
+	return agent.ModelResult{Text: "done", Effects: []agent.ModelEffect{{
+		CallID: "call_react", Intent: agent.EffectIntent{Kind: agent.EffectReact, TargetMessageID: request.CurrentMessageID, Emoji: "✅"},
+	}}}, nil
+}
+
+type redirectedReactionModel struct{ target identity.MessageID }
+
+func (model *redirectedReactionModel) Generate(context.Context, agent.ModelRequest) (agent.ModelResult, error) {
+	return agent.ModelResult{Text: "done", Effects: []agent.ModelEffect{{
+		CallID: "call_redirect", Intent: agent.EffectIntent{Kind: agent.EffectReact, TargetMessageID: model.target, Emoji: "✅"},
+	}}}, nil
+}
+
+func (model *fakeModel) Generate(context.Context, agent.ModelRequest) (agent.ModelResult, error) {
+	model.calls.Add(1)
+	return agent.ModelResult{Text: model.text}, nil
+}
+
+type blockingModel struct {
+	started   chan agent.ModelRequest
+	release   chan struct{}
+	callCount atomic.Int32
+}
+
+func (model *blockingModel) Generate(ctx context.Context, request agent.ModelRequest) (agent.ModelResult, error) {
+	model.callCount.Add(1)
+	model.started <- request
+	select {
+	case <-ctx.Done():
+		return agent.ModelResult{}, ctx.Err()
+	case <-model.release:
+		return agent.ModelResult{Text: "captured reply"}, nil
+	}
+}
+
+type trackingModel struct {
+	delay time.Duration
+	// waitFor, when set, holds each call until that many calls are active at
+	// once (or a deadline passes), so overlap does not depend on scheduling.
+	waitFor int32
+	active  atomic.Int32
+	maximum atomic.Int32
+}
+
+func (model *trackingModel) Generate(context.Context, agent.ModelRequest) (agent.ModelResult, error) {
+	active := model.active.Add(1)
+	for {
+		maximum := model.maximum.Load()
+		if active <= maximum || model.maximum.CompareAndSwap(maximum, active) {
+			break
+		}
+	}
+	if model.waitFor > 0 {
+		deadline := time.Now().Add(5 * time.Second)
+		for model.maximum.Load() < model.waitFor && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	time.Sleep(model.delay)
+	model.active.Add(-1)
+	return agent.ModelResult{Text: "reply"}, nil
+}
+
+type fakeDispatcher struct{ calls atomic.Int32 }
+
+func (dispatcher *fakeDispatcher) Dispatch(_ context.Context, ref agent.DispatchRef) (agent.DeliveryResult, error) {
+	dispatcher.calls.Add(1)
+	now := time.Now().UTC()
+	return agent.DeliveryResult{ActionID: ref.ActionID, Status: agent.DeliverySucceeded, CompletedAt: &now}, nil
+}
+
+type fakeEffectDispatcher struct {
+	calls atomic.Int32
+	last  agent.EffectDispatchRef
+}
+
+func (dispatcher *fakeEffectDispatcher) DispatchEffect(_ context.Context, ref agent.EffectDispatchRef) error {
+	dispatcher.calls.Add(1)
+	dispatcher.last = ref
+	return nil
+}
+
+type failingDispatcher struct{ err error }
+
+func (dispatcher failingDispatcher) Dispatch(context.Context, agent.DispatchRef) (agent.DeliveryResult, error) {
+	return agent.DeliveryResult{}, dispatcher.err
+}
+
+func snapshotOf(t *testing.T, current *agent.Agent) agent.ConfigSnapshot {
+	t.Helper()
+	snapshot, err := current.Config().Refresh(context.Background())
+	if err != nil {
+		t.Fatalf("refresh config: %v", err)
+	}
+	return snapshot
+}

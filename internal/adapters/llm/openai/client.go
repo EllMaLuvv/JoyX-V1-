@@ -1,0 +1,918 @@
+package openai
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"regexp"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/action"
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/agent"
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/command"
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/identity"
+)
+
+const maxProviderBodyBytes = 1 << 20
+
+type Config struct {
+	Endpoint         string
+	APIKey           string
+	ProviderID       identity.ProviderID
+	SystemPolicy     string
+	Timeout          time.Duration
+	Concurrency      uint32
+	MaxResponseBytes uint32
+	HTTPClient       *http.Client
+	Observer         Observer
+	Commands         *command.Registry
+	// RateLimitRetries is how often a throttled (HTTP 429) request is replayed,
+	// waiting out the provider's own retry hint. Zero never retries.
+	RateLimitRetries int
+}
+
+type Observer interface {
+	ObserveModel(time.Duration, agent.ErrorCode)
+}
+
+type discardObserver struct{}
+
+func (discardObserver) ObserveModel(time.Duration, agent.ErrorCode) {}
+
+type Client struct {
+	endpoint         string
+	apiKey           string
+	providerID       identity.ProviderID
+	systemPolicy     string
+	httpClient       *http.Client
+	semaphore        chan struct{}
+	timeout          time.Duration
+	maxResponseBytes uint32
+	observer         Observer
+	commands         *command.Registry
+	rateLimitRetries int
+	now              func() time.Time
+}
+
+func New(config Config) (*Client, error) {
+	endpoint, err := validateEndpoint(config.Endpoint)
+	if err != nil {
+		return nil, agent.NewError(agent.ErrorInvalidArgument, "create LLM client", err)
+	}
+	if strings.TrimSpace(config.APIKey) == "" || config.ProviderID.IsZero() || strings.TrimSpace(config.SystemPolicy) == "" || config.Commands == nil {
+		return nil, agent.NewError(agent.ErrorInvalidArgument, "create LLM client", fmt.Errorf("credentials, provider ID, and system policy are required"))
+	}
+	if config.Timeout <= 0 || config.Timeout > 10*time.Minute {
+		return nil, agent.NewError(agent.ErrorInvalidArgument, "create LLM client", fmt.Errorf("timeout must be positive and at most 10 minutes"))
+	}
+	if config.Concurrency == 0 || config.Concurrency > 256 {
+		return nil, agent.NewError(agent.ErrorInvalidArgument, "create LLM client", fmt.Errorf("concurrency must be between 1 and 256"))
+	}
+	if config.MaxResponseBytes == 0 || config.MaxResponseBytes > agent.MaxResponseBytes {
+		return nil, agent.NewError(agent.ErrorInvalidArgument, "create LLM client", fmt.Errorf("response limit must be between 1 and %d bytes", agent.MaxResponseBytes))
+	}
+	httpClient := config.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: config.Timeout}
+	}
+	clientCopy := *httpClient
+	if clientCopy.CheckRedirect == nil {
+		clientCopy.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+	}
+	observer := config.Observer
+	if observer == nil {
+		observer = discardObserver{}
+	}
+	return &Client{
+		endpoint:         endpoint,
+		apiKey:           config.APIKey,
+		providerID:       config.ProviderID,
+		systemPolicy:     config.SystemPolicy,
+		httpClient:       &clientCopy,
+		semaphore:        make(chan struct{}, config.Concurrency),
+		timeout:          config.Timeout,
+		maxResponseBytes: config.MaxResponseBytes,
+		observer:         observer,
+		commands:         config.Commands,
+		rateLimitRetries: config.RateLimitRetries,
+		now:              time.Now,
+	}, nil
+}
+
+func (client *Client) Generate(ctx context.Context, request agent.ModelRequest) (result agent.ModelResult, resultErr error) {
+	started := time.Now()
+	defer func() { client.observer.ObserveModel(time.Since(started), agent.CodeOf(resultErr)) }()
+	if request.Model.ProviderID != client.providerID {
+		return agent.ModelResult{}, agent.NewError(agent.ErrorUnsupported, "generate model response", fmt.Errorf("provider is not configured"))
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, client.timeout)
+	defer cancel()
+	select {
+	case <-requestCtx.Done():
+		return agent.ModelResult{}, llmContextError("wait for model capacity", requestCtx.Err())
+	case client.semaphore <- struct{}{}:
+	}
+	defer func() { <-client.semaphore }()
+
+	messages, tools, err := client.messages(request)
+	if err != nil {
+		return agent.ModelResult{}, err
+	}
+	httpResponse, err := client.post(requestCtx, request, messages, tools)
+	if err == nil && len(request.Images) > 0 && imagesRejected(httpResponse.StatusCode) {
+		// A model that cannot read images rejects the request. The turn then
+		// runs on the transcript alone, where each image is a placeholder.
+		_, _ = io.Copy(io.Discard, io.LimitReader(httpResponse.Body, maxProviderBodyBytes))
+		httpResponse.Body.Close()
+		messages[len(messages)-1].Images = nil
+		httpResponse, err = client.post(requestCtx, request, messages, tools)
+	}
+	if err != nil {
+		return agent.ModelResult{}, err
+	}
+	defer httpResponse.Body.Close()
+	if httpResponse.StatusCode < 200 || httpResponse.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(httpResponse.Body, maxProviderBodyBytes))
+		return agent.ModelResult{}, statusError(httpResponse.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(httpResponse.Body, maxProviderBodyBytes+1))
+	if err != nil {
+		return agent.ModelResult{}, agent.NewError(agent.ErrorProviderFailure, "read model response", err)
+	}
+	if len(body) > maxProviderBodyBytes {
+		return agent.ModelResult{}, agent.NewError(agent.ErrorProviderFailure, "read model response", fmt.Errorf("provider response body is too large"))
+	}
+	var decoded completionResponse
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return agent.ModelResult{}, agent.NewError(agent.ErrorProviderFailure, "decode model response", err)
+	}
+	if len(decoded.Choices) == 0 {
+		return agent.ModelResult{}, agent.NewError(agent.ErrorProviderFailure, "decode model response", fmt.Errorf("provider returned no choices"))
+	}
+	message := decoded.Choices[0].Message
+	if message.Role != "" && message.Role != "assistant" {
+		return agent.ModelResult{}, agent.NewError(agent.ErrorProviderFailure, "decode model response", fmt.Errorf("unexpected response role"))
+	}
+	if len(message.Content) > int(client.maxResponseBytes) {
+		return agent.ModelResult{}, agent.NewError(agent.ErrorProviderFailure, "decode model response", fmt.Errorf("provider response exceeds configured byte limit"))
+	}
+	text, replyTo, effects, err := decodeModelOutput(message.Content, message.ToolCalls, request, client.commands)
+	if err != nil {
+		return agent.ModelResult{}, err
+	}
+	if len(text) > int(client.maxResponseBytes) {
+		// Quiz choices must not push a reply over the configured limit; the
+		// reply still goes out, as plain text.
+		if plain, choices := action.SplitChoices(text); len(choices) > 0 {
+			text = plain
+		}
+	}
+	return agent.ModelResult{Text: text, ReplyToMessageID: replyTo, Effects: effects}, nil
+}
+
+// post sends one completion request. The caller closes the response body.
+func (client *Client) post(ctx context.Context, request agent.ModelRequest, messages []completionMessage, tools []completionTool) (*http.Response, error) {
+	payload, err := json.Marshal(completionRequest{
+		Model:     request.Model.Model,
+		Messages:  messages,
+		MaxTokens: request.Model.MaxOutputTokens,
+		Stream:    false,
+		Tools:     tools,
+	})
+	if err != nil {
+		return nil, agent.NewError(agent.ErrorInternal, "encode model request", err)
+	}
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, client.endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return nil, agent.NewError(agent.ErrorInternal, "create model request", err)
+	}
+	httpRequest.Header.Set("Authorization", "Bearer "+client.apiKey)
+	httpRequest.Header.Set("Content-Type", "application/json")
+	httpRequest.Header.Set("Accept", "application/json")
+	// A message carrying images takes the existing path instead: a provider that
+	// refuses them gets one attempt and the images are dropped rather than waited
+	// out, so a throttled chat does not stall behind a picture.
+	retryOnThrottle := client.rateLimitRetries > 0 && len(request.Images) == 0
+	httpResponse, err := client.sendWithRateLimitRetry(ctx, httpRequest, payload, retryOnThrottle)
+	if err != nil {
+		return nil, err
+	}
+	if httpResponse.StatusCode >= 400 {
+		body, _ := io.ReadAll(io.LimitReader(httpResponse.Body, maxProviderBodyBytes))
+		httpResponse.Body.Close()
+		fmt.Fprintf(os.Stderr, "[model-debug] status=%d payload_bytes=%d images=%d body=%s\n",
+			httpResponse.StatusCode, len(payload), len(request.Images), strings.TrimSpace(string(body)))
+		httpResponse.Body = io.NopCloser(bytes.NewReader(body))
+	}
+	return httpResponse, nil
+}
+
+// rateLimitRetries is how many times a throttled request is replayed; a
+// provider's tokens-per-minute window usually opens within seconds.
+const rateLimitRetries = 4
+
+// retryAfterPattern matches Groq's "Please try again in 9.5025s." hint.
+var retryAfterPattern = regexp.MustCompile(`(?i)try again in ([0-9.]+)\s*s`)
+
+// sendWithRateLimitRetry posts once and, when the provider says it is out of
+// token quota, waits for the retry hint in its own message before posting again.
+// Anything else returns immediately.
+func (client *Client) sendWithRateLimitRetry(ctx context.Context, request *http.Request, payload []byte, retry bool) (*http.Response, error) {
+	for attempt := 0; ; attempt++ {
+		// A request cannot be reused after its body was sent, so rebuild it.
+		sent, err := client.httpClient.Do(withRequestBody(request, payload))
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, llmContextError("invoke model", ctx.Err())
+			}
+			return nil, agent.NewError(agent.ErrorUnavailable, "invoke model", providerRequestError(err))
+		}
+		if !retry || sent.StatusCode != http.StatusTooManyRequests || attempt >= client.rateLimitRetries {
+			return sent, nil
+		}
+		body, _ := io.ReadAll(io.LimitReader(sent.Body, maxProviderBodyBytes))
+		sent.Body.Close()
+		delay := retryAfter(body)
+		fmt.Fprintf(os.Stderr, "[model-debug] status=429 payload_bytes=%d retrying_in=%s\n", len(payload), delay.Round(time.Millisecond))
+		select {
+		case <-ctx.Done():
+			return nil, llmContextError("invoke model", ctx.Err())
+		case <-time.After(delay):
+		}
+	}
+}
+
+// withRequestBody returns a shallow copy carrying a fresh body, so one request
+// object can be posted repeatedly.
+func withRequestBody(request *http.Request, payload []byte) *http.Request {
+	copied := request.Clone(request.Context())
+	copied.Body = io.NopCloser(bytes.NewReader(payload))
+	return copied
+}
+
+// retryAfter reads the provider's "try again in Ns" hint, defaulting to five
+// seconds and capping at twelve so a full set of retries still fits inside the
+// caller's request timeout (a minute).
+func retryAfter(body []byte) time.Duration {
+	match := retryAfterPattern.FindSubmatch(body)
+	if len(match) == 2 {
+		if seconds, err := strconv.ParseFloat(string(match[1]), 64); err == nil && seconds > 0 {
+			return min(time.Duration(seconds*float64(time.Second)), 12*time.Second)
+		}
+	}
+	return 5 * time.Second
+}
+
+// imagesRejected reports whether status may mean the provider refused the
+// request for its images, rather than for the caller's credentials or rate.
+func imagesRejected(status int) bool {
+	switch status {
+	case http.StatusBadRequest, http.StatusNotFound, http.StatusRequestEntityTooLarge,
+		http.StatusUnsupportedMediaType, http.StatusUnprocessableEntity:
+		return true
+	}
+	return false
+}
+
+func (client *Client) messages(request agent.ModelRequest) ([]completionMessage, []completionTool, error) {
+	if strings.TrimSpace(request.Model.Model) == "" || request.Model.MaxOutputTokens == 0 {
+		return nil, nil, agent.NewError(agent.ErrorInvalidArgument, "build model request", fmt.Errorf("model configuration is required"))
+	}
+	if err := agent.ValidateModelMessages(request.Messages); err != nil {
+		return nil, nil, err
+	}
+	tools, err := completionTools(request, client.commands)
+	if err != nil {
+		return nil, nil, err
+	}
+	// The date is filled in per request so a long-running bot never tells the
+	// model the day it was started.
+	systemContent := strings.ReplaceAll(client.systemPolicy, "{{current_date}}", client.now().Format("02 Jan 2006"))
+	additionalPromptCount := strings.Count(systemContent, "{{additional_prompt}}")
+	if additionalPromptCount > 1 {
+		return nil, nil, agent.NewError(agent.ErrorIntegrityFailure, "build model request", fmt.Errorf("system policy has duplicate additional prompt placeholders"))
+	}
+	var additionalPrompt string
+	for _, message := range request.Messages {
+		if message.Provenance == agent.ProvenanceBasePrompt {
+			additionalPrompt = message.AdditionalPrompt
+		}
+	}
+	if additionalPromptCount == 0 && additionalPrompt != "" {
+		return nil, nil, agent.NewError(agent.ErrorIntegrityFailure, "build model request", fmt.Errorf("system policy is missing its additional prompt placeholder"))
+	}
+	if additionalPromptCount == 1 {
+		systemContent = strings.Replace(systemContent, "{{additional_prompt}}", additionalPrompt, 1)
+	}
+	messages := []completionMessage{{Role: "system", Content: systemContent}}
+	for _, message := range request.Messages {
+		if message.Provenance == agent.ProvenanceBasePrompt {
+			continue
+		}
+		role := ""
+		switch message.Role {
+		case agent.ModelSystem:
+			role = "system"
+		case agent.ModelUser:
+			role = "user"
+		case agent.ModelAssistant:
+			role = "assistant"
+		default:
+			return nil, nil, agent.NewError(agent.ErrorInvalidArgument, "build model request", fmt.Errorf("invalid model message role"))
+		}
+		messages = append(messages, completionMessage{Role: role, Content: message.Content})
+	}
+	// The images belong to the current messages, which end the transcript.
+	messages[len(messages)-1].Images = request.Images
+	return messages, tools, nil
+}
+
+type completionRequest struct {
+	Model     string              `json:"model"`
+	Messages  []completionMessage `json:"messages"`
+	MaxTokens uint32              `json:"max_tokens"`
+	Stream    bool                `json:"stream"`
+	Tools     []completionTool    `json:"tools,omitempty"`
+}
+
+type completionMessage struct {
+	Role      string          `json:"role"`
+	Content   string          `json:"content"`
+	ToolCalls json.RawMessage `json:"tool_calls,omitempty"`
+	// Images follow Content in a request, each after its label.
+	Images []agent.ModelImage `json:"-"`
+}
+
+// MarshalJSON writes Content as plain text, or as text and image parts when
+// the message carries images.
+func (message completionMessage) MarshalJSON() ([]byte, error) {
+	type plain completionMessage
+	if len(message.Images) == 0 {
+		return json.Marshal(plain(message))
+	}
+	parts := []map[string]any{{"type": "text", "text": message.Content}}
+	for _, image := range message.Images {
+		if image.Label != "" {
+			parts = append(parts, map[string]any{"type": "text", "text": image.Label})
+		}
+		parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]string{
+			"url": "data:" + image.Mime + ";base64," + base64.StdEncoding.EncodeToString(image.Data),
+		}})
+	}
+	return json.Marshal(struct {
+		Role    string           `json:"role"`
+		Content []map[string]any `json:"content"`
+	}{message.Role, parts})
+}
+
+type completionResponse struct {
+	Choices []struct {
+		Message completionMessage `json:"message"`
+	} `json:"choices"`
+}
+
+type completionTool struct {
+	Type     string             `json:"type"`
+	Function completionFunction `json:"function"`
+}
+
+type completionFunction struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
+	Arguments   json.RawMessage `json:"arguments,omitempty"`
+}
+
+type completionToolCall struct {
+	ID       string             `json:"id"`
+	Type     string             `json:"type"`
+	Function completionFunction `json:"function"`
+}
+
+func completionTools(request agent.ModelRequest, registry *command.Registry) ([]completionTool, error) {
+	capabilities := request.Capabilities.Values()
+	if request.CurrentMessageID.IsZero() {
+		return nil, agent.NewError(agent.ErrorInvalidArgument, "build model tools", fmt.Errorf("current message identity is required for tools"))
+	}
+	contextIDs := sortedContextMessageIDs(request.ContextMessages)
+	replyContextIDs := append([]string{"none"}, contextIDs...)
+	commandDescription := "No registered command is available for this invocation; use null."
+	if len(request.Commands) > 0 {
+		// The system prompt explains each command the model may get, so the
+		// schema only says which are available now. Descriptions are for
+		// people reading /help.
+		available := make([]string, 0, len(request.Commands))
+		for _, name := range request.Commands {
+			if _, _, ok := registry.Parse("/" + name); !ok {
+				return nil, agent.NewError(agent.ErrorIntegrityFailure, "build model tools", fmt.Errorf("command is not registered"))
+			}
+			available = append(available, "/"+name)
+		}
+		commandDescription = "Each item is one complete command, written as the system prompt explains. Available now: " + strings.Join(available, ", ") + ". Any other command is unavailable."
+	}
+	replyParameters, err := json.Marshal(map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"context_msg_id": map[string]any{
+				"type":        "string",
+				"enum":        replyContextIDs,
+				"description": "Use none for an ordinary reply; otherwise use one exact six-digit ID from the supplied compact history.",
+			},
+			"text": map[string]any{
+				"type":        "string",
+				"minLength":   1,
+				"description": "Visible reply text. Put anything the user may want to copy (code, commands, templates) in one fenced ``` block: the first block is also sent with a Copy button. For a person mention, copy an exact canonical `@Name (senderRef)` already shown in the transcript, or construct it from one `Name 【senderRef】` sender line; for example `Budi 【a1b2c3】` becomes `@Budi (a1b2c3)`. Never write bare `@Budi`, `@a1b2c3`, or `Budi (@a1b2c3)`. Special forms are `@all (all)`, `@admin (admin)` to tag the group admins, and the bot mention `@<assistant name> (Bot)` using the configured assistant name from the system prompt.",
+			},
+			"choices": map[string]any{
+				"type":        []string{"array", "null"},
+				"items":       map[string]any{"type": "string", "minLength": 1, "maxLength": action.MaxChoiceRunes},
+				"maxItems":    action.MaxChoices,
+				"description": "Quiz buttons under the reply: 2 to 5 short, mutually exclusive answers (max 20 characters each). They make the reply a bulky special message that annoys users when repeated, so use them sparingly: only for a requested quiz or poll, or a real decision that needs a clear pick. Never for casual chat, open-ended or rhetorical questions, or consecutive replies. Keep any explanation of the options in text. A tapped button comes back as the user's message with that choice's text. Default null.",
+			},
+			"command": map[string]any{
+				"type":        []string{"array", "null"},
+				"items":       map[string]any{"type": "string"},
+				"maxItems":    8,
+				"description": commandDescription,
+			},
+			"command_context_msg_id": map[string]any{
+				"type":        []string{"array", "null"},
+				"items":       map[string]any{"type": "string", "enum": replyContextIDs},
+				"maxItems":    8,
+				"description": "Optional per-command anchors; use none when a command has no message anchor.",
+			},
+		},
+		"required":             []string{"context_msg_id", "text", "choices", "command", "command_context_msg_id"},
+		"additionalProperties": false,
+	})
+	if err != nil {
+		return nil, agent.NewError(agent.ErrorInternal, "build model tools", err)
+	}
+	tools := []completionTool{{Type: "function", Function: completionFunction{
+		Name:        "reply_message",
+		Description: "Return the visible reply and optionally request authorized group commands. Inline person mentions must use an exact canonical `@Name (senderRef)` from the transcript or use both values from the same sender line. Use only exact compact history IDs supplied in the schema; use none for an ordinary reply. Commands are separately parsed and authorized.",
+		Parameters:  replyParameters,
+	}}}
+	for _, capability := range capabilities {
+		name, description, parameters, ok := toolSchema(capability, contextIDs, request.Stickers)
+		if !ok {
+			// Group command capabilities authorize command strings carried by
+			// reply_message. They are deliberately not standalone provider tools.
+			continue
+		}
+		tools = append(tools, completionTool{Type: "function", Function: completionFunction{Name: name, Description: description, Parameters: parameters}})
+	}
+	return tools, nil
+}
+
+func sortedContextMessageIDs(contextMessages map[string]identity.MessageID) []string {
+	ids := make([]string, 0, len(contextMessages))
+	for id := range contextMessages {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func toolSchema(capability agent.Capability, contextIDs, stickers []string) (string, string, json.RawMessage, bool) {
+	switch capability {
+	case agent.CapabilityMessageSticker:
+		// Without a catalog there is nothing to send, so no tool is offered.
+		if len(stickers) == 0 {
+			return "", "", nil, false
+		}
+		parameters, err := json.Marshal(map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"sticker_name": map[string]any{"type": "string", "enum": stickers},
+				"context_msg_id": map[string]any{
+					"type":        "string",
+					"enum":        append([]string{"none"}, contextIDs...),
+					"description": "Use none to send the sticker on its own; otherwise one exact six-digit ID from the supplied compact history to reply to, or to react to when as_reaction is true.",
+				},
+				"as_reaction": map[string]any{
+					"type":        "boolean",
+					"description": "true attaches the sticker to the message context_msg_id as a sticker reaction, like an emoji reaction but with a sticker; it needs a context_msg_id. false sends the sticker as a message.",
+				},
+			},
+			"required":             []string{"sticker_name", "context_msg_id", "as_reaction"},
+			"additionalProperties": false,
+		})
+		if err != nil {
+			return "", "", nil, false
+		}
+		return "send_sticker", "Send one sticker from this chat's sticker catalog, by exact name, as a message or as a sticker reaction on a message. It can stand in for a text reply or go with one.", parameters, true
+	case agent.CapabilitySubagent:
+		fileIDs := map[string]any{"type": "string"}
+		if len(contextIDs) > 0 {
+			fileIDs["enum"] = contextIDs
+		}
+		parameters, err := json.Marshal(map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"instruction": map[string]any{
+					"type":        "string",
+					"minLength":   1,
+					"description": "Clear, detailed instruction for the sub-agent to execute.",
+				},
+				"confirmation_text": map[string]any{
+					"type":      "string",
+					"minLength": 1,
+					"description": "A brief confirmation message to the user that SPECIFICALLY states what you are about to do, in their language and WhatsApp formatting. " +
+						"Say the concrete action, e.g. \"Converting your PDF to Word now\" or \"Fixing the chart colors and re-rendering it\". " +
+						"Do NOT send vague filler like \"let me try again\", \"ok\", or \"working on it\" — the user should understand what is happening from this message alone. " +
+						"On a correction re-dispatch, name what you are correcting (e.g. \"That came back in the wrong format — redoing it as a spreadsheet\"). " +
+						"If input files are provided via context_msg_ids, this message is sent as a reply to the last file ID to acknowledge receipt.",
+				},
+				"context_msg_ids": map[string]any{
+					"type":        []string{"array", "null"},
+					"items":       fileIDs,
+					"maxItems":    agent.MaxSubtaskFiles,
+					"description": "Six-digit IDs of the messages whose file (or text) the sub-agent needs: the message that HOLDS the file, never the request that refers to it. Use null when the task needs no input.",
+				},
+				"high_quality": map[string]any{
+					"type":        "boolean",
+					"description": "true for tasks requiring deeper reasoning, complex code generation, or analysis; false for routine tasks like format conversion or simple scripting.",
+				},
+			},
+			"required":             []string{"instruction", "confirmation_text", "context_msg_ids", "high_quality"},
+			"additionalProperties": false,
+		})
+		if err != nil {
+			return "", "", nil, false
+		}
+		return "execute_subtask", "Delegate a complex task to a sub-agent for execution. " +
+			"The sub-agent will process the instruction and return a report. " +
+			"Use this for tasks that require multi-step reasoning, file processing, or operations that are too complex for a single LLM call. " +
+			"Any output files the sub-agent produces are automatically attached and sent to the chat after your text reply, one file per WhatsApp message — you do not need to mention file paths or upload them yourself. " +
+			"Make the instruction precise so the sub-agent only emits files the user actually wants delivered. " +
+			"While a sub-agent task is running in this chat, calling this again steers that task instead of starting a new one.", parameters, true
+	case "message.react":
+		contextProperty := map[string]any{"type": "string", "minLength": 6, "maxLength": 6}
+		if len(contextIDs) > 0 {
+			contextProperty["enum"] = contextIDs
+		}
+		parameters, err := json.Marshal(map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"context_msg_id": contextProperty,
+				"emoji":          map[string]any{"type": "string", "maxLength": 64},
+			},
+			"required":             []string{"context_msg_id", "emoji"},
+			"additionalProperties": false,
+		})
+		if err != nil {
+			return "", "", nil, false
+		}
+		return "react_to_message", "React to one message from the supplied compact history. Use only an exact six-digit history ID from the schema.", parameters, true
+	default:
+		return "", "", nil, false
+	}
+}
+
+func decodeModelOutput(content string, raw json.RawMessage, request agent.ModelRequest, registry *command.Registry) (string, identity.MessageID, []agent.ModelEffect, error) {
+	if len(raw) == 0 || string(raw) == "null" || string(raw) == "[]" {
+		return content, identity.MessageID{}, nil, nil
+	}
+	if request.CurrentMessageID.IsZero() {
+		return "", identity.MessageID{}, nil, agent.NewError(agent.ErrorIntegrityFailure, "decode model response", fmt.Errorf("tool response has no current message target"))
+	}
+	var calls []completionToolCall
+	if err := json.Unmarshal(raw, &calls); err != nil {
+		return "", identity.MessageID{}, nil, agent.NewError(agent.ErrorProviderFailure, "decode model response", err)
+	}
+	if len(calls) == 0 || len(calls) > agent.MaxModelEffects {
+		return "", identity.MessageID{}, nil, agent.NewError(agent.ErrorProviderFailure, "decode model response", fmt.Errorf("tool calls are invalid or exceed the limit"))
+	}
+	seen := make(map[string]struct{}, len(calls))
+	effects := make([]agent.ModelEffect, 0, len(calls))
+	replyText := content
+	var replyTo identity.MessageID
+	replySeen := false
+	// execute_subtask carries its own acknowledgement, which becomes the
+	// visible reply when reply_message was not called.
+	var confirmation string
+	var confirmationTo identity.MessageID
+	subtaskSeen := false
+	for _, call := range calls {
+		if call.Type != "function" || strings.TrimSpace(call.ID) != call.ID || call.ID == "" || len(call.ID) > 128 {
+			return "", identity.MessageID{}, nil, agent.NewError(agent.ErrorProviderFailure, "decode model response", fmt.Errorf("tool call identity is invalid"))
+		}
+		if _, exists := seen[call.ID]; exists {
+			return "", identity.MessageID{}, nil, agent.NewError(agent.ErrorProviderFailure, "decode model response", fmt.Errorf("tool call ID is duplicated"))
+		}
+		seen[call.ID] = struct{}{}
+		if call.Function.Name == "reply_message" {
+			if replySeen {
+				return "", identity.MessageID{}, nil, agent.NewError(agent.ErrorProviderFailure, "decode model response", fmt.Errorf("reply_message may only be called once"))
+			}
+			text, choices, target, commands, err := decodeReplyMessage(call, request, registry)
+			if err != nil {
+				return "", identity.MessageID{}, nil, err
+			}
+			if strings.TrimSpace(content) != "" && content != text {
+				return "", identity.MessageID{}, nil, agent.NewError(agent.ErrorProviderFailure, "decode model response", fmt.Errorf("content conflicts with reply_message text"))
+			}
+			// Quiz choices ride in the stored text; see action.WithChoices.
+			if withChoices := action.WithChoices(text, choices); len(withChoices) <= agent.MaxResponseBytes {
+				text = withChoices
+			}
+			replyText, replyTo, replySeen = text, target, true
+			effects = append(effects, commands...)
+			continue
+		}
+		if call.Function.Name == "execute_subtask" {
+			if !request.Capabilities.Has(agent.CapabilitySubagent) {
+				return "", identity.MessageID{}, nil, agent.NewError(agent.ErrorPermissionDenied, "decode model response", fmt.Errorf("tool capability was not granted"))
+			}
+			intent, text, target, ok, err := decodeSubtask(call.Function, request)
+			if err != nil {
+				return "", identity.MessageID{}, nil, err
+			}
+			// A task naming a file that is not in the chat is dropped together
+			// with its acknowledgement, and so is a second task: the first one
+			// would only be steered by it.
+			if !ok || subtaskSeen {
+				continue
+			}
+			subtaskSeen, confirmation, confirmationTo = true, text, target
+			effects = append(effects, agent.ModelEffect{CallID: call.ID, Intent: intent})
+			continue
+		}
+		intent, capability, err := decodeToolIntent(call.Function, request)
+		if err != nil {
+			return "", identity.MessageID{}, nil, err
+		}
+		if !request.Capabilities.Has(capability) {
+			return "", identity.MessageID{}, nil, agent.NewError(agent.ErrorPermissionDenied, "decode model response", fmt.Errorf("tool capability was not granted"))
+		}
+		effects = append(effects, agent.ModelEffect{CallID: call.ID, Intent: intent})
+	}
+	if confirmation != "" {
+		switch {
+		case strings.TrimSpace(replyText) == "":
+			replyText, replyTo = confirmation, confirmationTo
+		case !strings.Contains(replyText, confirmation) && len(replyText)+len(confirmation)+2 <= agent.MaxResponseBytes:
+			if plain, choices := action.SplitChoices(replyText); len(choices) > 0 {
+				replyText = action.WithChoices(plain+"\n\n"+confirmation, choices)
+			} else {
+				replyText += "\n\n" + confirmation
+			}
+		}
+	}
+	return replyText, replyTo, effects, nil
+}
+
+// maxSubtaskArgumentBytes bounds execute_subtask's arguments. An instruction
+// is a self-contained brief, so it may be much longer than a reply.
+const maxSubtaskArgumentBytes = agent.MaxInputBytes + 8*1024
+
+// decodeSubtask decodes one execute_subtask call into its intent, its
+// confirmation text and the message that text replies to (the last file, when
+// there is one). ok is false when the call must be ignored.
+func decodeSubtask(function completionFunction, request agent.ModelRequest) (agent.EffectIntent, string, identity.MessageID, bool, error) {
+	var args struct {
+		Instruction      string          `json:"instruction"`
+		ConfirmationText string          `json:"confirmation_text"`
+		ContextMessageID json.RawMessage `json:"context_msg_ids"`
+		HighQuality      json.RawMessage `json:"high_quality"`
+	}
+	if err := decodeArgumentsLimit(function.Arguments, &args, maxSubtaskArgumentBytes); err != nil {
+		return agent.EffectIntent{}, "", identity.MessageID{}, false, err
+	}
+	instruction := strings.TrimSpace(args.Instruction)
+	if instruction == "" || len(instruction) > agent.MaxInputBytes {
+		return agent.EffectIntent{}, "", identity.MessageID{}, false, nil
+	}
+	// Models send context_msg_ids as an array, a single string, or null, and
+	// some write "none" or "null" for no files.
+	var rawIDs []any
+	if json.Unmarshal(args.ContextMessageID, &rawIDs) != nil {
+		var single string
+		if json.Unmarshal(args.ContextMessageID, &single) == nil {
+			rawIDs = []any{single}
+		}
+	}
+	intent := agent.EffectIntent{Kind: agent.EffectSubtask, Instruction: instruction}
+	_ = json.Unmarshal(args.HighQuality, &intent.HighQuality)
+	seen := make(map[identity.MessageID]struct{}, len(rawIDs))
+	for _, raw := range rawIDs {
+		id, isText := raw.(string)
+		if raw == nil {
+			continue
+		}
+		if !isText {
+			return agent.EffectIntent{}, "", identity.MessageID{}, false, nil
+		}
+		id = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(id), "#"))
+		switch strings.ToLower(id) {
+		case "", "none", "null":
+			continue
+		}
+		target, ok := request.ContextMessages[id]
+		if !ok {
+			return agent.EffectIntent{}, "", identity.MessageID{}, false, nil
+		}
+		if _, duplicate := seen[target]; duplicate {
+			continue
+		}
+		seen[target] = struct{}{}
+		intent.FileMessageIDs = append(intent.FileMessageIDs, target)
+	}
+	if len(intent.FileMessageIDs) > agent.MaxSubtaskFiles {
+		return agent.EffectIntent{}, "", identity.MessageID{}, false, nil
+	}
+	var replyTo identity.MessageID
+	if len(intent.FileMessageIDs) > 0 {
+		replyTo = intent.FileMessageIDs[len(intent.FileMessageIDs)-1]
+	}
+	confirmation := strings.TrimSpace(args.ConfirmationText)
+	if len(confirmation) > agent.MaxResponseBytes {
+		confirmation = ""
+	}
+	return intent, confirmation, replyTo, true, nil
+}
+
+func decodeToolIntent(function completionFunction, request agent.ModelRequest) (agent.EffectIntent, agent.Capability, error) {
+	switch function.Name {
+	case "react_to_message":
+		var args struct {
+			ContextMessageID string `json:"context_msg_id"`
+			Emoji            string `json:"emoji"`
+		}
+		if err := decodeArguments(function.Arguments, &args); err != nil {
+			return agent.EffectIntent{}, "", err
+		}
+		target, ok := request.ContextMessages[args.ContextMessageID]
+		if !ok {
+			return agent.EffectIntent{}, "", agent.NewError(agent.ErrorProviderFailure, "decode model response", fmt.Errorf("reaction context message is not in the supplied history"))
+		}
+		return agent.EffectIntent{Kind: agent.EffectReact, TargetMessageID: target, Emoji: args.Emoji}, "message.react", nil
+	case "send_sticker":
+		var args struct {
+			StickerName      string `json:"sticker_name"`
+			ContextMessageID string `json:"context_msg_id"`
+			AsReaction       bool   `json:"as_reaction"`
+		}
+		if err := decodeArguments(function.Arguments, &args); err != nil {
+			return agent.EffectIntent{}, "", err
+		}
+		if !slices.Contains(request.Stickers, args.StickerName) {
+			return agent.EffectIntent{}, "", agent.NewError(agent.ErrorProviderFailure, "decode model response", fmt.Errorf("sticker is not in the chat's catalog"))
+		}
+		// Like reply_message, an unknown anchor only drops the quote. A
+		// reaction with no message to attach to goes out as a plain sticker.
+		target := request.ContextMessages[args.ContextMessageID]
+		return agent.EffectIntent{Kind: agent.EffectSticker, Sticker: args.StickerName, TargetMessageID: target, StickerReaction: args.AsReaction && !target.IsZero()}, agent.CapabilityMessageSticker, nil
+	default:
+		return agent.EffectIntent{}, "", agent.NewError(agent.ErrorProviderFailure, "decode model response", fmt.Errorf("tool name is not declared"))
+	}
+}
+
+func decodeReplyMessage(call completionToolCall, request agent.ModelRequest, registry *command.Registry) (string, []string, identity.MessageID, []agent.ModelEffect, error) {
+	var args struct {
+		ContextMessageID        string          `json:"context_msg_id"`
+		Text                    string          `json:"text"`
+		Choices                 []string        `json:"choices"`
+		Commands                []string        `json:"command"`
+		CommandContextMessageID json.RawMessage `json:"command_context_msg_id"`
+	}
+	if err := decodeArguments(call.Function.Arguments, &args); err != nil {
+		return "", nil, identity.MessageID{}, nil, err
+	}
+	if strings.TrimSpace(args.Text) == "" || len(args.Text) > agent.MaxResponseBytes {
+		return "", nil, identity.MessageID{}, nil, agent.NewError(agent.ErrorProviderFailure, "decode reply_message", fmt.Errorf("reply text is invalid"))
+	}
+	// Unknown anchors do not suppress a visible reply; they simply omit the quote.
+	replyTo := request.ContextMessages[args.ContextMessageID]
+	if len(args.Commands) > agent.MaxModelEffects {
+		return "", nil, identity.MessageID{}, nil, agent.NewError(agent.ErrorProviderFailure, "decode reply_message", fmt.Errorf("commands exceed the allowed limit"))
+	}
+	// Models send command_context_msg_id as an array, a single string, or null.
+	var anchors []string
+	if json.Unmarshal(args.CommandContextMessageID, &anchors) != nil {
+		var single string
+		if json.Unmarshal(args.CommandContextMessageID, &single) == nil {
+			anchors = []string{single}
+		}
+	}
+	effects := make([]agent.ModelEffect, 0, len(args.Commands))
+	for index, commandText := range args.Commands {
+		commandText = strings.TrimSpace(commandText)
+		if commandText != "" && !strings.HasPrefix(commandText, "/") {
+			commandText = "/" + commandText
+		}
+		parsed, _, recognized := registry.Parse(commandText)
+		if !recognized {
+			// A malformed optional command must not suppress the visible reply.
+			continue
+		}
+		canonical := "/" + parsed.Name
+		if parsed.ArgumentsPresent {
+			canonical += " " + parsed.Arguments
+		}
+		anchor := args.ContextMessageID
+		if index < len(anchors) {
+			anchor = anchors[index]
+		}
+		var commandTarget identity.MessageID
+		if anchor != "none" {
+			var ok bool
+			if commandTarget, ok = request.ContextMessages[anchor]; !ok {
+				return "", nil, identity.MessageID{}, nil, agent.NewError(agent.ErrorProviderFailure, "decode reply_message", fmt.Errorf("command context is not in the supplied history"))
+			}
+		}
+		effects = append(effects, agent.ModelEffect{CallID: fmt.Sprintf("%s:%d", call.ID, index), Intent: agent.EffectIntent{Kind: agent.EffectRunCommand, TargetMessageID: commandTarget, Command: canonical}})
+	}
+	return args.Text, args.Choices, replyTo, effects, nil
+}
+
+func decodeArguments(raw json.RawMessage, value any) error {
+	return decodeArgumentsLimit(raw, value, 4*1024)
+}
+
+func decodeArgumentsLimit(raw json.RawMessage, value any, limit int) error {
+	// The raw value is the arguments as a JSON string, so escaping may make
+	// it up to twice as long as the arguments themselves.
+	if len(raw) > 2*limit+2 {
+		return agent.NewError(agent.ErrorProviderFailure, "decode model response", fmt.Errorf("tool arguments exceed the allowed limit"))
+	}
+	var arguments string
+	if err := json.Unmarshal(raw, &arguments); err != nil {
+		return agent.NewError(agent.ErrorProviderFailure, "decode model response", err)
+	}
+	if len(arguments) > limit {
+		return agent.NewError(agent.ErrorProviderFailure, "decode model response", fmt.Errorf("tool arguments exceed the allowed limit"))
+	}
+	decoder := json.NewDecoder(strings.NewReader(arguments))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		return agent.NewError(agent.ErrorProviderFailure, "decode model response", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return agent.NewError(agent.ErrorProviderFailure, "decode model response", fmt.Errorf("tool arguments contain extra values"))
+	}
+	return nil
+}
+
+func validateEndpoint(value string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("LLM endpoint must be an absolute URL")
+	}
+	if parsed.Scheme != "https" && parsed.Scheme != "http" {
+		return "", fmt.Errorf("LLM endpoint must use HTTP or HTTPS")
+	}
+	if parsed.User != nil || parsed.Fragment != "" {
+		return "", fmt.Errorf("LLM endpoint must not contain credentials or a fragment")
+	}
+	path := strings.TrimRight(parsed.Path, "/")
+	if !strings.HasSuffix(path, "/chat/completions") {
+		parsed.Path = path + "/chat/completions"
+		parsed.RawPath = ""
+	}
+	return parsed.String(), nil
+}
+
+func statusError(status int) error {
+	switch {
+	case status == http.StatusRequestTimeout || status == http.StatusGatewayTimeout:
+		return agent.NewError(agent.ErrorTimeout, "invoke model", fmt.Errorf("provider returned HTTP %d", status))
+	case status == http.StatusTooManyRequests:
+		return agent.NewError(agent.ErrorRateLimited, "invoke model", fmt.Errorf("provider returned HTTP %d", status))
+	case status >= 500:
+		return agent.NewError(agent.ErrorUnavailable, "invoke model", fmt.Errorf("provider returned HTTP %d", status))
+	default:
+		return agent.NewError(agent.ErrorProviderFailure, "invoke model", fmt.Errorf("provider returned HTTP %d", status))
+	}
+}
+
+func providerRequestError(err error) error {
+	var requestError *url.Error
+	if errors.As(err, &requestError) && requestError.Err != nil {
+		// Preserve the native transport failure without echoing the configured
+		// provider URL, which may itself contain deployment-sensitive routing.
+		return requestError.Err
+	}
+	return err
+}
+
+func llmContextError(operation string, err error) error {
+	if err == context.DeadlineExceeded {
+		return agent.NewError(agent.ErrorTimeout, operation, err)
+	}
+	return agent.NewError(agent.ErrorCancelled, operation, err)
+}

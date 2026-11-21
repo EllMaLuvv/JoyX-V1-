@@ -1,0 +1,378 @@
+package command
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"strings"
+	"time"
+
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/action"
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/agent"
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/conversation"
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/identity"
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/sticker"
+)
+
+// Context is everything a running command may use.
+type Context struct {
+	// Name is the canonical name of the running command.
+	Name string
+	// Args is the text after "/name ", verbatim. HasArgs is true when the
+	// token was followed by a space, even if Args is empty.
+	Args    string
+	HasArgs bool
+	Message conversation.IncomingMessage
+	Facts   PermissionFacts
+	Agent   *agent.Agent
+	// Config is the chat's config as read just before the command ran.
+	Config agent.ConfigSnapshot
+
+	registry   *Registry
+	invocation Invocation
+}
+
+// Key identifies the chat the command runs in.
+func (c *Context) Key() agent.Key {
+	return agent.Key{TenantID: c.Message.TenantID, AccountID: c.Message.AccountID, ChatID: c.Message.ChatID}
+}
+
+// AssistantName is the bot's configured display name.
+func (c *Context) AssistantName() string { return c.invocation.Platform.AssistantName }
+
+// Commands lists every registered command, sorted by name.
+func (c *Context) Commands() []Command { return c.registry.Commands() }
+
+// Reply sends text to the chat. In a batch of commands the bot runs, the
+// text joins the batch's one message instead.
+func (c *Context) Reply(ctx context.Context, text string) error {
+	if c.invocation.Notices != nil {
+		c.invocation.Notices.add(noticeEntry{text: text})
+		return nil
+	}
+	return c.send(ctx, text)
+}
+
+// Notice reports a change the command made: a person who typed the command
+// gets notice.Text, and the bot's batch gets a short line (see Notice).
+func (c *Context) Notice(ctx context.Context, notice Notice) error {
+	if c.invocation.Notices != nil {
+		c.invocation.Notices.add(noticeEntry{notice: &notice})
+		return nil
+	}
+	if notice.Text == "" {
+		return nil
+	}
+	return c.send(ctx, notice.Text)
+}
+
+func (c *Context) send(ctx context.Context, text string) error {
+	sender := c.invocation.Platform.Text
+	if sender == nil {
+		return c.unavailable("text replies")
+	}
+	actionID, err := identity.NewActionID()
+	if err != nil {
+		return agent.NewError(agent.ErrorInternal, "create /"+c.Name+" reply ID", err)
+	}
+	_, err = sender.SendText(ctx, action.SendTextRequest{Key: c.Key(), ActionID: actionID, Text: text})
+	return err
+}
+
+// ReplyButtons sends text with quick-reply buttons. A tap runs the button's
+// command (this one unless Button.Command says otherwise) with its Args.
+func (c *Context) ReplyButtons(ctx context.Context, text string, buttons ...Button) error {
+	return c.replyInteractive(ctx, text, "", buttons, nil)
+}
+
+// ReplyMenus sends text and a footer line with list menus. Picking an option
+// runs it like a Button tap.
+func (c *Context) ReplyMenus(ctx context.Context, text, footer string, menus ...Menu) error {
+	return c.replyInteractive(ctx, text, footer, nil, menus)
+}
+
+func (c *Context) replyInteractive(ctx context.Context, text, footer string, buttons []Button, menus []Menu) error {
+	if count := len(buttons) + len(menus); count == 0 || count > action.MaxButtons {
+		return agent.NewError(agent.ErrorInvalidArgument, "send /"+c.Name+" buttons", fmt.Errorf("1 to %d buttons and menus are required", action.MaxButtons))
+	}
+	for _, menu := range menus {
+		if len(menu.Options) == 0 || len(menu.Options) > action.MaxMenuRows {
+			return agent.NewError(agent.ErrorInvalidArgument, "send /"+c.Name+" menu", fmt.Errorf("a menu needs 1 to %d options", action.MaxMenuRows))
+		}
+	}
+	sender := c.invocation.Platform.Buttons
+	if sender == nil {
+		return c.replyButtonsAsText(ctx, text, buttons, menus)
+	}
+	actionID, err := identity.NewActionID()
+	if err != nil {
+		return agent.NewError(agent.ErrorInternal, "create /"+c.Name+" reply ID", err)
+	}
+	request := action.SendButtonsRequest{Key: c.Key(), ActionID: actionID, Text: text, Footer: footer, Buttons: make([]action.Button, 0, len(buttons))}
+	for _, button := range buttons {
+		request.Buttons = append(request.Buttons, action.Button{ID: c.buttonID(button), Label: button.Label})
+	}
+	for _, menu := range menus {
+		rows := make([]action.MenuRow, 0, len(menu.Options))
+		for _, option := range menu.Options {
+			rows = append(rows, action.MenuRow{ID: c.buttonID(option), Title: option.Label, Description: option.Description})
+		}
+		request.Menus = append(request.Menus, action.Menu{Title: menu.Title, Rows: rows})
+	}
+	_, err = sender.SendButtons(ctx, request)
+	if agent.IsCode(err, agent.ErrorUnsupported) {
+		// The provider definitively rejected the buttons (WhatsApp does
+		// for some accounts or chats), so nothing was delivered and the
+		// text form is safe to send. Ambiguous failures are not retried
+		// as text, which could deliver both.
+		return c.replyButtonsAsText(ctx, text, buttons, menus)
+	}
+	return err
+}
+
+// replyButtonsAsText sends the commands the buttons and menus would have
+// sent, as text the user can type.
+func (c *Context) replyButtonsAsText(ctx context.Context, text string, buttons []Button, menus []Menu) error {
+	lines := []string{text, ""}
+	for _, button := range buttons {
+		lines = append(lines, "• "+button.Label+": "+c.buttonID(button))
+	}
+	for _, menu := range menus {
+		lines = append(lines, "*"+menu.Title+"*")
+		for _, option := range menu.Options {
+			lines = append(lines, "• "+option.Label+": "+c.buttonID(option))
+		}
+	}
+	return c.send(ctx, strings.Join(lines, "\n"))
+}
+
+// buttonID is what a tap sends back: the button's command with its args.
+func (c *Context) buttonID(button Button) string {
+	name := button.Command
+	if name == "" {
+		name = c.Name
+	}
+	if button.Args == "" {
+		return "/" + name
+	}
+	return "/" + name + " " + button.Args
+}
+
+// Group returns the group moderation port.
+func (c *Context) Group() (GroupModerator, error) {
+	if c.invocation.Platform.Group == nil {
+		return nil, c.unavailable("group moderation")
+	}
+	return c.invocation.Platform.Group, nil
+}
+
+// ScheduleTask makes the bot run prompt in this chat at fireAt, as if asked
+// then. It returns an error if the host cannot schedule tasks.
+func (c *Context) ScheduleTask(ctx context.Context, fireAt time.Time, prompt string) (Task, error) {
+	if c.invocation.Platform.Tasks == nil {
+		return Task{}, c.unavailable("scheduled tasks")
+	}
+	return c.invocation.Platform.Tasks.ScheduleTask(ctx, c.Key(), c.invocation.Message.ID, fireAt, prompt)
+}
+
+// ScheduleDailyTask makes the bot run prompt in this chat every day at
+// minute (minutes after midnight, in the bot's time zone).
+func (c *Context) ScheduleDailyTask(ctx context.Context, minute int, prompt string) (Task, error) {
+	if c.invocation.Platform.Tasks == nil {
+		return Task{}, c.unavailable("scheduled tasks")
+	}
+	return c.invocation.Platform.Tasks.ScheduleDailyTask(ctx, c.Key(), c.invocation.Message.ID, minute, prompt)
+}
+
+// Tasks lists this chat's scheduled and daily tasks, soonest first.
+func (c *Context) Tasks(ctx context.Context) ([]Task, error) {
+	if c.invocation.Platform.Tasks == nil {
+		return nil, c.unavailable("scheduled tasks")
+	}
+	return c.invocation.Platform.Tasks.Tasks(ctx, c.Key())
+}
+
+// CancelTask deletes this chat's one-off or daily task with this code. It
+// reports false when there is none.
+func (c *Context) CancelTask(ctx context.Context, code string, daily bool) (bool, error) {
+	if c.invocation.Platform.Tasks == nil {
+		return false, c.unavailable("scheduled tasks")
+	}
+	return c.invocation.Platform.Tasks.CancelTask(ctx, c.Key(), code, daily)
+}
+
+// AddDeadline saves a deadline reminder for this chat, due at deadline. It
+// returns an error if the host cannot store deadlines.
+func (c *Context) AddDeadline(ctx context.Context, name string, deadline time.Time) (Deadline, error) {
+	if c.invocation.Platform.Deadlines == nil {
+		return Deadline{}, c.unavailable("deadline reminders")
+	}
+	return c.invocation.Platform.Deadlines.AddDeadline(ctx, c.Key(), c.invocation.Message.ID, name, deadline)
+}
+
+// Deadlines lists this chat's deadline reminders, soonest first.
+func (c *Context) Deadlines(ctx context.Context) ([]Deadline, error) {
+	if c.invocation.Platform.Deadlines == nil {
+		return nil, c.unavailable("deadline reminders")
+	}
+	return c.invocation.Platform.Deadlines.Deadlines(ctx, c.Key())
+}
+
+// DeleteDeadline removes this chat's deadline with this short code. It reports
+// false when there is no such deadline.
+func (c *Context) DeleteDeadline(ctx context.Context, code string) (bool, error) {
+	if c.invocation.Platform.Deadlines == nil {
+		return false, c.unavailable("deadline reminders")
+	}
+	return c.invocation.Platform.Deadlines.DeleteDeadline(ctx, c.Key(), code)
+}
+
+// QuotedRaw returns the raw provider payload of the message this command
+// replied to. It is captured only for /catch invocations.
+func (c *Context) QuotedRaw(ctx context.Context) (RawQuotedMessage, error) {
+	if c.invocation.Store == nil {
+		return RawQuotedMessage{}, agent.NewError(agent.ErrorNotFound, "read quoted message", errors.New("command has no durable inbox record"))
+	}
+	return c.invocation.Store.ReadRawQuotedMessage(ctx, c.Message)
+}
+
+// Media downloads the image, video or sticker this command was sent with,
+// or else the one it replied to. A command the bot runs gets the media of
+// the message it targets. It returns an agent.ErrorNotFound error when there
+// is none.
+func (c *Context) Media(ctx context.Context) (Media, error) {
+	if c.invocation.Platform.Media == nil {
+		return Media{}, c.unavailable("media download")
+	}
+	var payload []byte
+	var err error
+	switch {
+	case c.invocation.Store != nil:
+		payload, err = c.invocation.Store.ReadCommandMedia(ctx, c.Message)
+	case c.Message.Quote != nil && !c.Message.Quote.ID.IsZero():
+		if c.invocation.Platform.MessageMedia == nil {
+			return Media{}, c.unavailable("media of a targeted message")
+		}
+		payload, err = c.invocation.Platform.MessageMedia.ReadMessageMedia(ctx, c.Key(), c.Message.Quote.ID)
+	default:
+		err = agent.NewError(agent.ErrorNotFound, "read command media", errors.New("command has no media and targets no message"))
+	}
+	if err != nil {
+		return Media{}, err
+	}
+	return c.invocation.Platform.Media.DownloadMedia(ctx, payload)
+}
+
+// SendImage sends data as an image, replying to the command message.
+func (c *Context) SendImage(ctx context.Context, data []byte, mimetype string) error {
+	if c.invocation.Platform.MediaSender == nil {
+		return c.unavailable("sending images")
+	}
+	return c.invocation.Platform.MediaSender.SendImage(ctx, c.Key(), data, mimetype, c.Message.ID)
+}
+
+// SendVideo sends data as a video, replying to the command message.
+func (c *Context) SendVideo(ctx context.Context, data []byte, mimetype string) error {
+	if c.invocation.Platform.MediaSender == nil {
+		return c.unavailable("sending videos")
+	}
+	return c.invocation.Platform.MediaSender.SendVideo(ctx, c.Key(), data, mimetype, c.Message.ID)
+}
+
+// SendDocument sends a local file as a WhatsApp document, replying to the
+// command message. Documents are delivered byte for byte, so a download keeps
+// the resolution and bitrate it was fetched with.
+func (c *Context) SendDocument(ctx context.Context, path, name, mime string) error {
+	if c.invocation.Platform.Files == nil {
+		return c.unavailable("sending files")
+	}
+	_, err := c.invocation.Platform.Files.SendFile(ctx, c.Key(), OutboundFile{Path: path, Name: name, Mime: mime})
+	return err
+}
+
+// DeleteBotMessages revokes every message the bot sent in this chat, for
+// everyone, and returns how many were revoked.
+func (c *Context) DeleteBotMessages(ctx context.Context) (int, error) {
+	if c.invocation.Platform.Revoker == nil {
+		return 0, c.unavailable("deleting the bot's messages")
+	}
+	return c.invocation.Platform.Revoker.DeleteBotMessages(ctx, c.Key())
+}
+
+// Restart asks the host to stop, so a supervisor or the operator can start the
+// bot again.
+func (c *Context) Restart(ctx context.Context) error {
+	if c.invocation.Platform.Restarter == nil {
+		return c.unavailable("restarting")
+	}
+	return c.invocation.Platform.Restarter.Restart(ctx)
+}
+
+// FetchRemoteMedia downloads a public TikTok, Instagram or Facebook video.
+// The caller owns the returned file and must remove it.
+func (c *Context) FetchRemoteMedia(ctx context.Context, rawURL string) (RemoteMedia, error) {
+	if c.invocation.Platform.RemoteMedia == nil {
+		return RemoteMedia{}, c.unavailable("downloading videos")
+	}
+	return c.invocation.Platform.RemoteMedia.Fetch(ctx, rawURL)
+}
+
+// Memory returns the chat's long-term memory store.
+func (c *Context) Memory() (MemoryStore, error) {
+	if c.invocation.Platform.Memory == nil {
+		return nil, c.unavailable("long-term memory")
+	}
+	return c.invocation.Platform.Memory, nil
+}
+
+// Subagent returns the sub-agent switch, or nil when no sub-agent service is
+// configured.
+func (c *Context) Subagent() SubagentControl { return c.invocation.Platform.Subagent }
+
+// SendSticker sends a sticker to the chat as a reply to the command message.
+func (c *Context) SendSticker(ctx context.Context, value sticker.Sticker) error {
+	if c.invocation.Platform.Stickers == nil {
+		return c.unavailable("stickers")
+	}
+	return c.invocation.Platform.Stickers.SendSticker(ctx, c.Key(), value, c.Message.ID)
+}
+
+// Stickers returns the chat sticker catalog.
+func (c *Context) Stickers() (sticker.Catalog, error) {
+	if c.invocation.Platform.Catalog == nil {
+		return nil, c.unavailable("sticker catalog")
+	}
+	return c.invocation.Platform.Catalog, nil
+}
+
+// ResetHistory clears the chat's conversation history.
+func (c *Context) ResetHistory(ctx context.Context) error {
+	if err := c.Agent.History().Reset(ctx, c.Config.Version); err != nil {
+		return err
+	}
+	if c.invocation.Observer != nil {
+		c.invocation.Observer.ObserveHistoryReset()
+	}
+	return nil
+}
+
+// UpdateConfig applies change to the chat's config and returns the new
+// snapshot. change must set absolute values: a command replayed after a crash
+// runs change again, and a write that already landed then changes nothing, so
+// it is skipped instead of being applied twice.
+func (c *Context) UpdateConfig(ctx context.Context, change func(*agent.ConfigValues)) (agent.ConfigSnapshot, error) {
+	desired := c.Config.Values()
+	change(&desired)
+	if err := agent.ValidateConfigValues(desired); err != nil {
+		return agent.ConfigSnapshot{}, err
+	}
+	if reflect.DeepEqual(desired, c.Config.Values()) {
+		return c.Config, nil
+	}
+	return c.Agent.Config().Update(ctx, c.Config.Version, change)
+}
+
+func (c *Context) unavailable(capability string) error {
+	return agent.NewError(agent.ErrorUnavailable, "run /"+c.Name, fmt.Errorf("%s: not available in this host", capability))
+}

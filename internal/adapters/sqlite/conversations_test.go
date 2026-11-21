@@ -1,0 +1,222 @@
+package sqlite
+
+import (
+	"context"
+	"database/sql"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/agent"
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/control"
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/conversation"
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/effect"
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/identity"
+)
+
+func TestDeletedMessageIDsOnlyReadsVisiblePage(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `CREATE TABLE typed_effects (
+		tenant_id TEXT, account_id TEXT, chat_id TEXT, kind INTEGER,
+		state INTEGER, target_message_id TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	tenantID, _ := identity.NewTenantID()
+	accountID, _ := identity.NewAccountID()
+	chatID, _ := identity.NewChatID()
+	visibleID, _ := identity.NewMessageID()
+	hiddenID, _ := identity.NewMessageID()
+	if _, err := db.ExecContext(ctx, `INSERT INTO typed_effects VALUES (?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?)`,
+		tenantID.String(), accountID.String(), chatID.String(), uint8(effect.KindDeleteMessage), uint8(effect.StateSucceeded), visibleID.String(),
+		tenantID.String(), accountID.String(), chatID.String(), uint8(effect.KindDeleteMessage), uint8(effect.StateSucceeded), hiddenID.String()); err != nil {
+		t.Fatal(err)
+	}
+	scope := control.SessionScope{TenantID: tenantID, AccountID: accountID}
+	deleted, err := deletedMessageIDs(ctx, db, scope, chatID, []control.BotMessage{{ID: visibleID}})
+	if err != nil || len(deleted) != 1 {
+		t.Fatalf("visible deleted messages = %v, err = %v", deleted, err)
+	}
+	if _, ok := deleted[visibleID.String()]; !ok {
+		t.Fatal("visible deleted message was omitted")
+	}
+}
+
+func TestConversationReaderListsBotTranscriptWithoutOpeningDatabaseForWrites(t *testing.T) {
+	ctx := context.Background()
+	dataRoot := t.TempDir()
+	tenantID, _ := identity.NewTenantID()
+	accountID, _ := identity.NewAccountID()
+	path := filepath.Join(dataRoot, "tenants", tenantID.String(), "app.db")
+	store, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("open app database: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	candidate := testCandidate(t, "conversation-reader-message", "120363000000000001@s.whatsapp.net")
+	candidate.TenantID, candidate.AccountID = tenantID, accountID
+	candidate.ChatKind = conversation.ChatDirect
+	candidate.SenderName = "Ayu"
+	candidate.Allowlisted = true
+	candidate.OccurredAt, candidate.ReceivedAt = now, now
+	claimed, err := store.Inbound().ClaimAndResolveSender(ctx, candidate)
+	if err != nil {
+		t.Fatalf("claim incoming message: %v", err)
+	}
+	key := agent.Key{TenantID: tenantID, AccountID: accountID, ChatID: claimed.Message.ChatID}
+	config, err := store.Configs().LoadOrCreate(ctx, key, testDefaults(t))
+	if err != nil {
+		t.Fatalf("create chat config: %v", err)
+	}
+	assistantID, _ := identity.NewMessageID()
+	assistantEntry := agent.HistoryEntry{
+		MessageID: assistantID, InvocationID: claimed.Message.InvocationID,
+		Causation: agent.CausationRef{Kind: agent.CausationMessage, ID: claimed.Message.CausationID},
+		Role:      agent.HistoryAssistant, Content: []agent.ContentPart{agent.TextPart{Text: "Halo, Ayu."}},
+		Delivery: agent.DeliverySucceeded, CreatedAt: now.Add(time.Second),
+	}
+	if err := store.History().Append(ctx, key, assistantEntry); err != nil {
+		t.Fatalf("append assistant response: %v", err)
+	}
+
+	reader, err := NewConversationReader(dataRoot)
+	if err != nil {
+		t.Fatalf("create reader: %v", err)
+	}
+	t.Cleanup(func() { _ = reader.Close() })
+	scope := control.SessionScope{TenantID: tenantID, AccountID: accountID}
+	conversations, err := reader.ListBotConversations(ctx, scope, transcriptPageSize)
+	if err != nil || len(conversations) != 1 {
+		t.Fatalf("list conversations = %#v, err=%v", conversations, err)
+	}
+	chat := conversations[0]
+	if chat.ID != claimed.Message.ChatID || chat.Kind != "direct" || chat.Name != "Ayu" ||
+		chat.LastMessage != "Halo, Ayu." || !chat.LastFromBot || chat.MessageCount != 2 {
+		t.Fatalf("unexpected bot conversation: %#v", chat)
+	}
+
+	messages, err := reader.ListBotMessages(ctx, scope, chat.ID, transcriptPageSize)
+	if err != nil || len(messages) != 2 {
+		t.Fatalf("list messages = %#v, err=%v", messages, err)
+	}
+	if messages[0].Role != "user" || messages[0].Sender != "Ayu" || messages[0].Content != candidate.Text ||
+		messages[1].Role != "assistant" || messages[1].Sender != "Bot" || messages[1].Delivery != "sent" {
+		t.Fatalf("unexpected transcript order/content: %#v", messages)
+	}
+
+	readOnlyDB, exists, err := reader.open(ctx, scope)
+	if err != nil || !exists {
+		t.Fatalf("open read-only transcript store: exists=%v err=%v", exists, err)
+	}
+	if _, err := readOnlyDB.ExecContext(ctx, `DELETE FROM history_entries`); err == nil {
+		t.Fatal("transcript reader unexpectedly allowed a database write")
+	}
+
+	if err := store.History().ResetIfConfigVersion(ctx, key, config.Version, now.Add(2*time.Second)); err != nil {
+		t.Fatalf("reset transcript: %v", err)
+	}
+	conversations, err = reader.ListBotConversations(ctx, scope, transcriptPageSize)
+	if err != nil || len(conversations) != 0 {
+		t.Fatalf("history reset should hide the chat: %#v, err=%v", conversations, err)
+	}
+}
+
+func TestConversationReaderLoadsPassiveGroupHistoryWithoutAgentConfig(t *testing.T) {
+	ctx := context.Background()
+	dataRoot := t.TempDir()
+	tenantID, _ := identity.NewTenantID()
+	accountID, _ := identity.NewAccountID()
+	path := filepath.Join(dataRoot, "tenants", tenantID.String(), "app.db")
+	store, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("open app database: %v", err)
+	}
+	defer store.Close()
+
+	candidate := testCandidate(t, "passive-group-history", "120363000000000002@g.us")
+	candidate.TenantID, candidate.AccountID = tenantID, accountID
+	candidate.ChatKind = conversation.ChatGroup
+	candidate.SenderName = "Rina"
+	candidate.Allowlisted = true
+	claimed, err := store.Inbound().ClaimAndResolveSender(ctx, candidate)
+	if err != nil {
+		t.Fatalf("claim passive group message: %v", err)
+	}
+	key := agent.Key{TenantID: tenantID, AccountID: accountID, ChatID: claimed.Message.ChatID}
+	if _, err := store.Configs().Load(ctx, key); !agent.IsCode(err, agent.ErrorNotFound) {
+		t.Fatalf("passive group unexpectedly has an Agent config: %v", err)
+	}
+
+	reader, err := NewConversationReader(dataRoot)
+	if err != nil {
+		t.Fatalf("create reader: %v", err)
+	}
+	t.Cleanup(func() { _ = reader.Close() })
+	messages, err := reader.ListBotMessages(ctx, control.SessionScope{TenantID: tenantID, AccountID: accountID}, key.ChatID, transcriptPageSize)
+	if err != nil || len(messages) != 1 {
+		t.Fatalf("read passive group transcript = %#v, err=%v", messages, err)
+	}
+	if messages[0].Role != "user" || messages[0].Sender != "Rina" || messages[0].Content != candidate.Text {
+		t.Fatalf("unexpected passive group message: %#v", messages[0])
+	}
+	if _, err := store.Configs().Load(ctx, key); !agent.IsCode(err, agent.ErrorNotFound) {
+		t.Fatalf("transcript read created an Agent config: %v", err)
+	}
+}
+
+func TestConversationReaderUsesPersistedGroupName(t *testing.T) {
+	ctx := context.Background()
+	dataRoot := t.TempDir()
+	tenantID, _ := identity.NewTenantID()
+	accountID, _ := identity.NewAccountID()
+	path := filepath.Join(dataRoot, "tenants", tenantID.String(), "app.db")
+	store, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("open app database: %v", err)
+	}
+	candidate := testCandidate(t, "group-name-message", "120363000000000001@g.us")
+	candidate.TenantID, candidate.AccountID = tenantID, accountID
+	candidate.ChatKind = conversation.ChatGroup
+	candidate.SenderName = "Rina"
+	candidate.Allowlisted = true
+	if _, err := store.Inbound().ClaimAndResolveSender(ctx, candidate); err != nil {
+		t.Fatalf("claim group message: %v", err)
+	}
+	reader, err := NewConversationReader(dataRoot)
+	if err != nil {
+		t.Fatalf("create reader: %v", err)
+	}
+	t.Cleanup(func() { _ = reader.Close() })
+	scope := control.SessionScope{TenantID: tenantID, AccountID: accountID}
+	assertName := func(want string) {
+		t.Helper()
+		chats, readErr := reader.ListBotConversations(ctx, scope, transcriptPageSize)
+		if readErr != nil || len(chats) != 1 || chats[0].Name != want {
+			t.Fatalf("group name = %#v, err=%v; want %q", chats, readErr, want)
+		}
+	}
+	assertName("Group")
+	if err := store.Inbound().SaveGroupName(ctx, tenantID, accountID, candidate.ProviderChatAddress, "  Keluarga  "); err != nil {
+		t.Fatalf("save group name: %v", err)
+	}
+	assertName("Keluarga")
+	otherAccountID, _ := identity.NewAccountID()
+	if err := store.Inbound().SaveGroupName(ctx, tenantID, otherAccountID, candidate.ProviderChatAddress, "Nama akun lain"); err != nil {
+		t.Fatalf("save name for another account: %v", err)
+	}
+	assertName("Keluarga")
+	if err := store.Inbound().SaveGroupName(ctx, tenantID, accountID, candidate.ProviderChatAddress, "Keluarga Besar"); err != nil {
+		t.Fatalf("save renamed group: %v", err)
+	}
+	assertName("Keluarga Besar")
+	if err := store.Close(); err != nil {
+		t.Fatalf("close app database: %v", err)
+	}
+	assertName("Keluarga Besar")
+}

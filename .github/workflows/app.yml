@@ -1,0 +1,211 @@
+name: app
+
+# The desktop and Android builds are slow, so they run only for release tags,
+# on demand, and on pull requests that touch the GUI. ci.yml covers the rest.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'frontend/**'
+      - 'cmd/app/**'
+      - 'cmd/webhost/**'
+      - 'internal/adapters/web/**'
+      - 'internal/ui/**'
+      - 'build/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/app.yml'
+      - '.github/actions/setup-app/**'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-build:
+    name: Windows desktop (amd64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-app
+      - name: Generate Wails bindings
+        run: wails3 generate bindings -f '-tags gui' -ts -i -clean=true ./cmd/app
+      - name: Verify generated bindings
+        run: git diff --exit-code -- frontend/bindings
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+      - name: Build Windows application
+        run: go build -tags gui,production -trimpath -buildvcs=false -ldflags='-s -w -H windowsgui' -o bin/WazzapAgent.exe ./cmd/app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WazzapAgent-windows-amd64
+          path: bin/WazzapAgent.exe
+          if-no-files-found: error
+
+  linux-build:
+    name: Linux desktop (amd64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential pkg-config libgtk-4-dev libwebkitgtk-6.0-dev libsoup-3.0-dev libayatana-appindicator3-dev
+      - uses: ./.github/actions/setup-app
+      - name: Generate Wails bindings
+        run: wails3 generate bindings -f '-tags gui' -ts -i -clean=true ./cmd/app
+      - name: Verify generated bindings
+        run: git diff --exit-code -- frontend/bindings
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+      - name: Build Linux application
+        run: go build -tags gui,production -trimpath -buildvcs=false -ldflags='-s -w' -o bin/WazzapAgent ./cmd/app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WazzapAgent-linux-amd64
+          path: bin/WazzapAgent
+          if-no-files-found: error
+
+  android-build:
+    name: Android APK (arm64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+      - name: Install native dependencies for Wails CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential pkg-config libgtk-4-dev libwebkitgtk-6.0-dev libsoup-3.0-dev libayatana-appindicator3-dev
+      - name: Install Android SDK and NDK
+        run: sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0' 'ndk;26.3.11579264'
+      - uses: ./.github/actions/setup-app
+      - name: Build Android debug APK
+        run: wails3 task android:build ARCH=arm64
+      - name: Verify Android startup registration
+        shell: bash
+        run: |
+          GOOS=android GOARCH=arm64 CGO_ENABLED=0 go list -e \
+            -overlay build/android/overlay.json -tags gui,android,debug \
+            -f '{{join .GoFiles "\n"}}' ./cmd/app | grep -Fx main_android.gen.go
+          go tool nm build/android/app/src/main/jniLibs/arm64-v8a/libwails.so \
+            | grep -E ' [Tt] main\.init(\.[0-9]+)?$'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WazzapAgent-android-arm64-debug
+          path: build/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+  webhost-build:
+    name: Web host for Debian/Linux (${{ matrix.goarch }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.19.0'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build browser bundle
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build:web
+      - name: Build web host
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -tags web -trimpath -buildvcs=false -ldflags='-s -w' -o bin/wazzapagent-web ./cmd/webhost
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wazzapagent-web-linux-${{ matrix.goarch }}
+          path: bin/wazzapagent-web
+          if-no-files-found: error
+
+  release-draft:
+    name: Draft GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - windows-build
+      - linux-build
+      - android-build
+      - webhost-build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows application
+        uses: actions/download-artifact@v4
+        with:
+          name: WazzapAgent-windows-amd64
+          path: release-input/windows
+      - name: Download Linux application
+        uses: actions/download-artifact@v4
+        with:
+          name: WazzapAgent-linux-amd64
+          path: release-input/linux
+      - name: Download Android APK
+        uses: actions/download-artifact@v4
+        with:
+          name: WazzapAgent-android-arm64-debug
+          path: release-input/android
+      - name: Download web host (amd64)
+        uses: actions/download-artifact@v4
+        with:
+          name: wazzapagent-web-linux-amd64
+          path: release-input/webhost-amd64
+      - name: Download web host (arm64)
+        uses: actions/download-artifact@v4
+        with:
+          name: wazzapagent-web-linux-arm64
+          path: release-input/webhost-arm64
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          cp release-input/windows/WazzapAgent.exe release-assets/WazzapAgent-windows-amd64.exe
+          chmod +x release-input/linux/WazzapAgent
+          tar -C release-input/linux -czf release-assets/WazzapAgent-linux-amd64.tar.gz WazzapAgent
+          cp release-input/android/app-debug.apk release-assets/WazzapAgent-android-arm64-debug.apk
+          for arch in amd64 arm64; do
+            chmod +x release-input/webhost-$arch/wazzapagent-web
+            tar -C release-input/webhost-$arch -czf release-assets/WazzapAgent-web-linux-$arch.tar.gz wazzapagent-web
+          done
+          (
+            cd release-assets
+            sha256sum WazzapAgent-* | sort -k 2 > SHA256SUMS
+          )
+      - name: Create or refresh draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" >/dev/null 2>&1; then
+            is_draft="$(gh release view "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --json isDraft --jq '.isDraft')"
+            if [ "$is_draft" != "true" ]; then
+              echo "Release $RELEASE_TAG is already published; leaving it unchanged."
+              exit 0
+            fi
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber --repo "$RELEASE_REPOSITORY"
+          else
+            gh release create "$RELEASE_TAG" release-assets/* --draft --verify-tag --generate-notes --title "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY"
+          fi

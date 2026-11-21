@@ -1,0 +1,584 @@
+package agent
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/identity"
+)
+
+type Dependencies struct {
+	Defaults     ConfigValues
+	ConfigStore  ConfigStore
+	HistoryStore HistoryStore
+	Turns        TurnStore
+	Context      ContextBuilder
+	ChatContext  ChatContextReader
+	// Images, when set, lets the model see the images of the current
+	// messages. Without it every image stays a text placeholder.
+	Images        ImageReader
+	HistoryWindow uint32
+	Model         ModelInvoker
+	Responses     ResponseDispatcher
+	Effects       EffectDispatcher
+	InvokeEvents  InvokeObserver
+	Clock         Clock
+}
+
+type ChatContextReader interface {
+	ReadChatContext(context.Context, Key) (ChatContext, error)
+}
+
+type InvokeObserver interface {
+	ObserveAgentInvokeStarted(Key, ModelConfig, string)
+	ObserveAgentInvokeFinished(Key, ModelConfig, string, time.Duration, ModelResult, error)
+}
+
+type DiscardInvokeObserver struct{}
+
+func (DiscardInvokeObserver) ObserveAgentInvokeStarted(Key, ModelConfig, string) {}
+func (DiscardInvokeObserver) ObserveAgentInvokeFinished(Key, ModelConfig, string, time.Duration, ModelResult, error) {
+}
+
+type Agent struct {
+	key           Key
+	config        *Config
+	history       *History
+	turns         TurnStore
+	model         ModelInvoker
+	context       ContextBuilder
+	chatContext   ChatContextReader
+	images        ImageReader
+	historyWindow uint32
+	responses     ResponseDispatcher
+	effects       EffectDispatcher
+	invokeEvents  InvokeObserver
+	clock         Clock
+	gate          *operationGate
+}
+
+func New(ctx context.Context, key Key, dependencies Dependencies) (*Agent, error) {
+	if err := key.Validate(); err != nil {
+		return nil, err
+	}
+	if dependencies.ConfigStore == nil || dependencies.HistoryStore == nil || dependencies.Turns == nil ||
+		dependencies.Context == nil || dependencies.ChatContext == nil || dependencies.Model == nil ||
+		dependencies.Responses == nil || dependencies.Clock == nil {
+		return nil, NewError(ErrorInvalidArgument, "create agent", fmt.Errorf("all Part 2 dependencies are required"))
+	}
+	if dependencies.HistoryWindow == 0 || dependencies.HistoryWindow > MaxHistoryPageSize {
+		return nil, NewError(ErrorInvalidArgument, "create agent", fmt.Errorf("history window must be between 1 and %d", MaxHistoryPageSize))
+	}
+	if dependencies.Effects == nil {
+		dependencies.Effects = rejectedEffectDispatcher{}
+	}
+	if dependencies.InvokeEvents == nil {
+		dependencies.InvokeEvents = DiscardInvokeObserver{}
+	}
+	config, err := newConfig(ctx, key, dependencies.Defaults, dependencies.ConfigStore)
+	if err != nil {
+		return nil, err
+	}
+	gate := newOperationGate()
+	history, err := newHistory(key, dependencies.HistoryStore, gate, dependencies.Clock)
+	if err != nil {
+		return nil, err
+	}
+	agent := &Agent{
+		key:           key,
+		config:        config,
+		history:       history,
+		turns:         dependencies.Turns,
+		model:         dependencies.Model,
+		context:       dependencies.Context,
+		chatContext:   dependencies.ChatContext,
+		images:        dependencies.Images,
+		historyWindow: dependencies.HistoryWindow,
+		responses:     dependencies.Responses,
+		effects:       dependencies.Effects,
+		invokeEvents:  dependencies.InvokeEvents,
+		clock:         dependencies.Clock,
+		gate:          gate,
+	}
+	return agent, nil
+}
+
+func (agent *Agent) Key() Key          { return agent.key }
+func (agent *Agent) Config() *Config   { return agent.config }
+func (agent *Agent) History() *History { return agent.history }
+
+// BuildInput returns the same bounded message list produced by the Agent's
+// context builder, without invoking the model. Authorization for exposing this
+// potentially sensitive data remains outside Agent.
+func (agent *Agent) BuildInput(ctx context.Context, version ConfigVersion, currentInvocationID identity.InvocationID) ([]ModelMessage, error) {
+	if version == 0 || currentInvocationID.IsZero() {
+		return nil, NewError(ErrorInvalidArgument, "build agent input", fmt.Errorf("config version and current invocation are required"))
+	}
+	if err := agent.gate.acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer agent.gate.release()
+	snapshot, err := agent.config.Refresh(ctx)
+	if err != nil {
+		return nil, NewError(ErrorIntegrityFailure, "build agent input", err)
+	}
+	if snapshot.Version != version {
+		return nil, NewError(ErrorConflict, "build agent input", fmt.Errorf("authorized config version changed"))
+	}
+	page, err := agent.history.List(ctx, version, HistoryQuery{
+		Limit: agent.historyWindow, ThroughInvocationID: currentInvocationID,
+	})
+	if err != nil {
+		return nil, NewError(ErrorIntegrityFailure, "build agent input", err)
+	}
+	chat, err := agent.chatContext.ReadChatContext(ctx, agent.key)
+	if err != nil {
+		return nil, err
+	}
+	messages, err := agent.context.Build(ContextBuildRequest{
+		Config: snapshot, Chat: chat, History: page.Entries, CurrentInvocationID: currentInvocationID,
+	})
+	if err != nil {
+		return nil, NewError(ErrorIntegrityFailure, "build agent input", err)
+	}
+	return messages, nil
+}
+
+// ReadChatContext reads the chat's current metadata, as a turn would.
+func (agent *Agent) ReadChatContext(ctx context.Context) (ChatContext, error) {
+	return agent.chatContext.ReadChatContext(ctx, agent.key)
+}
+
+func (agent *Agent) Invoke(ctx context.Context, invocation Invocation) (InvokeResult, error) {
+	return agent.invoke(ctx, invocation, nil, nil)
+}
+
+// InvokeWith reuses what the caller already read for this turn: the config
+// it authorized the turn against and, when set, the chat it observed. Effect
+// authorization still rereads current policy and group state.
+func (agent *Agent) InvokeWith(ctx context.Context, invocation Invocation, config ConfigSnapshot, chat *ChatContext) (InvokeResult, error) {
+	if err := validateConfigSnapshot(config); err != nil {
+		return InvokeResult{}, NewError(ErrorInvalidArgument, "invoke agent with config", err)
+	}
+	if chat != nil {
+		if err := chat.Validate(); err != nil {
+			return InvokeResult{}, NewError(ErrorInvalidArgument, "invoke agent with chat context", err)
+		}
+	}
+	return agent.invoke(ctx, invocation, &config, chat)
+}
+
+func (agent *Agent) invoke(ctx context.Context, invocation Invocation, config *ConfigSnapshot, observedChat *ChatContext) (InvokeResult, error) {
+	if err := agent.gate.acquire(ctx); err != nil {
+		return InvokeResult{}, err
+	}
+	defer agent.gate.release()
+
+	if err := validateInvocation(agent.key, invocation); err != nil {
+		return InvokeResult{}, err
+	}
+
+	// Looking up an existing plan before validating the current policy version
+	// is intentional: replay keeps the original immutable plan. Dispatch still
+	// performs a fresh external policy check immediately before the side effect.
+	record, loadErr := agent.turns.Load(ctx, agent.key, invocation.ID)
+	switch {
+	case loadErr == nil:
+		if record.Plan != nil {
+			if err := agent.ensureInvocationHistory(ctx, record.MessageID, invocation, record.Plan, record.Delivery); err != nil {
+				return InvokeResult{}, err
+			}
+			return agent.dispatchPlan(ctx, *record.Plan)
+		}
+		if record.State == TurnFailedTerminal {
+			return InvokeResult{}, NewError(ErrorProviderFailure, "invoke agent", fmt.Errorf("generation previously failed terminally"))
+		}
+	case IsCode(loadErr, ErrorNotFound):
+		// Continue with a new durable claim.
+	default:
+		return InvokeResult{}, loadErr
+	}
+
+	var snapshot ConfigSnapshot
+	var err error
+	if config != nil {
+		snapshot = *config
+	} else if snapshot, err = agent.config.Refresh(ctx); err != nil {
+		return InvokeResult{}, NewError(ErrorIntegrityFailure, "invoke agent", err)
+	}
+	if snapshot.Version != invocation.PolicyVersion {
+		return InvokeResult{}, NewError(ErrorConflict, "invoke agent", fmt.Errorf("policy decision used a stale config version"))
+	}
+
+	claim, err := agent.turns.Claim(ctx, ClaimTurnRequest{
+		Key:        agent.key,
+		Invocation: cloneInvocation(invocation),
+		Now:        agent.clock.Now(),
+	})
+	if err != nil {
+		return InvokeResult{}, NewError(ErrorStorageFailure, "invoke agent", err)
+	}
+	if claim.Plan != nil {
+		if err := agent.ensureInvocationHistory(ctx, claim.MessageID, invocation, claim.Plan, deliveryForTurnState(claim.State)); err != nil {
+			return InvokeResult{}, err
+		}
+		return agent.dispatchPlan(ctx, *claim.Plan)
+	}
+	if claim.State != TurnGenerating {
+		return InvokeResult{}, NewError(ErrorIntegrityFailure, "invoke agent", fmt.Errorf("turn store returned invalid generation claim"))
+	}
+	if claim.MessageID.IsZero() {
+		return InvokeResult{}, NewError(ErrorIntegrityFailure, "invoke agent", fmt.Errorf("turn store returned an empty message ID"))
+	}
+	if err := agent.history.appendWithinGate(ctx, invocationHistoryEntry(claim.MessageID, invocation)); err != nil {
+		agent.failGeneration(invocation.ID, err)
+		return InvokeResult{}, err
+	}
+	// The transcript may continue to receive passive group messages while this
+	// turn is waiting for its debounce window. Context is therefore bounded at
+	// this invocation rather than at the newest row in the whole chat.
+	page, err := agent.history.List(ctx, snapshot.Version, HistoryQuery{
+		Limit: agent.historyWindow, ThroughInvocationID: invocation.ID,
+	})
+	if err != nil {
+		wrappedErr := NewError(ErrorIntegrityFailure, "invoke agent", err)
+		agent.failGeneration(invocation.ID, wrappedErr)
+		return InvokeResult{}, wrappedErr
+	}
+	var chat ChatContext
+	if observedChat != nil {
+		chat = *observedChat
+	} else {
+		chat, err = agent.chatContext.ReadChatContext(ctx, agent.key)
+		if err != nil {
+			agent.failGeneration(invocation.ID, err)
+			return InvokeResult{}, err
+		}
+	}
+	messages, err := agent.context.Build(ContextBuildRequest{
+		Config: snapshot, Chat: chat, History: page.Entries, CurrentInvocationID: invocation.ID,
+	})
+	if err != nil {
+		wrappedErr := NewError(ErrorIntegrityFailure, "invoke agent", err)
+		agent.failGeneration(invocation.ID, wrappedErr)
+		return InvokeResult{}, wrappedErr
+	}
+
+	request := ModelRequest{
+		Key:              agent.key,
+		InvocationID:     invocation.ID,
+		CurrentMessageID: claim.MessageID,
+		ConfigVersion:    snapshot.Version,
+		Model:            snapshot.Model,
+		Messages:         messages,
+		Capabilities:     CapabilitySet{values: invocation.Capabilities.Values()},
+		Commands:         append([]string(nil), invocation.Commands...),
+		Stickers:         append([]string(nil), invocation.Stickers...),
+		ContextMessages:  contextMessageMap(page.Entries),
+		Images:           agent.currentImages(ctx, page.Entries, chat),
+	}
+	invokeStarted := time.Now()
+	chatName := chat.Name
+	if chat.Kind == "private" && invocation.Sender != nil {
+		chatName = invocation.Sender.DisplayName
+	}
+	agent.invokeEvents.ObserveAgentInvokeStarted(agent.key, request.Model, chatName)
+	generated, err := agent.model.Generate(ctx, request)
+	if err != nil {
+		agent.invokeEvents.ObserveAgentInvokeFinished(agent.key, request.Model, chatName, time.Since(invokeStarted), ModelResult{}, err)
+		wrappedErr := NewError(ErrorProviderFailure, "invoke agent", err)
+		agent.failGeneration(invocation.ID, wrappedErr)
+		return InvokeResult{}, wrappedErr
+	}
+	if strings.TrimSpace(generated.Text) == "" && utf8.ValidString(generated.Text) {
+		generated.Text = ""
+	}
+	if err := validateModelResult(generated, request.Capabilities, request.ContextMessages); err != nil {
+		agent.invokeEvents.ObserveAgentInvokeFinished(agent.key, request.Model, chatName, time.Since(invokeStarted), generated, err)
+		wrappedErr := NewError(ErrorProviderFailure, "invoke agent", err)
+		agent.failGeneration(invocation.ID, wrappedErr)
+		return InvokeResult{}, wrappedErr
+	}
+	agent.invokeEvents.ObserveAgentInvokeFinished(agent.key, request.Model, chatName, time.Since(invokeStarted), generated, nil)
+
+	plan, err := agent.turns.CommitPlan(ctx, CommitPlanRequest{
+		Key:              agent.key,
+		InvocationID:     invocation.ID,
+		CurrentMessageID: claim.MessageID,
+		ConfigVersion:    snapshot.Version,
+		ResponseText:     generated.Text,
+		ReplyToMessageID: generated.ReplyToMessageID,
+		Capabilities:     request.Capabilities,
+		Effects:          cloneModelEffects(generated.Effects),
+	})
+	if err != nil {
+		return InvokeResult{}, err
+	}
+	return agent.dispatchPlan(ctx, plan)
+}
+
+func contextMessageMap(entries []HistoryEntry) map[string]identity.MessageID {
+	result := make(map[string]identity.MessageID, len(entries))
+	for _, entry := range entries {
+		if entry.Sequence > 0 && !entry.MessageID.IsZero() {
+			// Keep lookup IDs byte-for-byte aligned with the compact transcript.
+			// Sequence numbers are durable and may cross the six-digit display
+			// boundary; the model only sees the modulo representation.
+			result[formatCompactContextID(entry.Sequence)] = entry.MessageID
+		}
+	}
+	return result
+}
+
+// invocationHistoryEntry is the transcript entry an invocation answers: a
+// chat message from its sender, or a system entry when the invocation has no
+// sender (a scheduled task).
+func invocationHistoryEntry(messageID identity.MessageID, invocation Invocation) HistoryEntry {
+	role := HistoryUser
+	if invocation.Sender == nil {
+		role = HistorySystem
+	}
+	return HistoryEntry{
+		MessageID: messageID, InvocationID: invocation.ID, Causation: invocation.Causation,
+		Role: role, Sender: cloneSender(invocation.Sender), Quote: cloneQuote(invocation.Quote),
+		Content: cloneContent(invocation.Input), Mentions: cloneMentions(invocation.Mentions),
+		Delivery: DeliveryNotStarted, CreatedAt: invocation.RequestedAt,
+	}
+}
+
+func (agent *Agent) ensureInvocationHistory(
+	ctx context.Context,
+	messageID identity.MessageID,
+	invocation Invocation,
+	plan *StoredPlan,
+	delivery DeliveryStatus,
+) error {
+	if messageID.IsZero() {
+		return Errorf(ErrorIntegrityFailure, "restore invocation history", "turn message ID is missing")
+	}
+	if err := agent.history.appendWithinGate(ctx, invocationHistoryEntry(messageID, invocation)); err != nil {
+		return NewError(ErrorStorageFailure, "restore invocation history", err)
+	}
+	if plan == nil {
+		return nil
+	}
+	if strings.TrimSpace(plan.Text) == "" {
+		// An effect-only plan has no reply to restore.
+		return nil
+	}
+	var quote *QuoteContext
+	if !plan.ReplyToMessageID.IsZero() {
+		page, err := agent.history.List(ctx, plan.ConfigVersion, HistoryQuery{
+			Limit: agent.historyWindow, ThroughInvocationID: invocation.ID,
+		})
+		if err != nil {
+			return NewError(ErrorStorageFailure, "restore invocation history", err)
+		}
+		for _, entry := range page.Entries {
+			if entry.MessageID != plan.ReplyToMessageID {
+				continue
+			}
+			if entry.Role != HistoryUser && (entry.Role != HistoryAssistant || entry.Delivery != DeliverySucceeded) {
+				return NewError(ErrorIntegrityFailure, "restore invocation history", fmt.Errorf("reply target is not a sent chat message"))
+			}
+			if len(entry.Content) != 1 {
+				return NewError(ErrorIntegrityFailure, "restore invocation history", fmt.Errorf("reply target content is invalid"))
+			}
+			text, ok := entry.Content[0].(TextPart)
+			if !ok {
+				return NewError(ErrorIntegrityFailure, "restore invocation history", fmt.Errorf("reply target content is unsupported"))
+			}
+			quote = &QuoteContext{
+				Sequence: entry.Sequence, MessageID: entry.MessageID,
+				Role: entry.Role, Text: text.Text,
+			}
+			if entry.Role == HistoryUser {
+				if entry.Sender == nil || entry.Sender.Ref.IsZero() {
+					return NewError(ErrorIntegrityFailure, "restore invocation history", fmt.Errorf("reply target sender is missing"))
+				}
+				quote.SenderRef = entry.Sender.Ref
+				quote.SenderIsAdmin = entry.Sender.IsAdmin
+				quote.SenderIsSuperAdmin = entry.Sender.IsSuperAdmin
+				quote.Mentions = cloneMentions(entry.Mentions)
+			}
+			break
+		}
+		if quote == nil {
+			return NewError(ErrorIntegrityFailure, "restore invocation history", fmt.Errorf("reply target is no longer in the supplied history"))
+		}
+	}
+	err := agent.history.appendWithinGate(ctx, HistoryEntry{
+		MessageID: plan.ResponseID, InvocationID: invocation.ID, Causation: invocation.Causation,
+		Role: HistoryAssistant, Quote: quote, Content: []ContentPart{TextPart{Text: plan.Text}},
+		Delivery: delivery, CreatedAt: plan.CreatedAt,
+	})
+	if err != nil {
+		return NewError(ErrorStorageFailure, "restore invocation history", err)
+	}
+	return nil
+}
+
+func deliveryForTurnState(state TurnState) DeliveryStatus {
+	switch state {
+	case TurnSucceeded:
+		return DeliverySucceeded
+	case TurnFailedTerminal:
+		return DeliveryFailedTerminal
+	case TurnUnknownOutcome:
+		return DeliveryUnknownOutcome
+	default:
+		return DeliveryPending
+	}
+}
+
+func (agent *Agent) dispatchPlan(ctx context.Context, plan StoredPlan) (InvokeResult, error) {
+	result := InvokeResult{
+		InvocationID:  plan.InvocationID,
+		ConfigVersion: plan.ConfigVersion,
+		ResponseID:    plan.ResponseID,
+		ActionID:      plan.ActionID,
+		Text:          plan.Text,
+		Delivery:      DeliveryPending,
+	}
+	if plan.ActionID.IsZero() {
+		if strings.TrimSpace(plan.Text) != "" || !plan.ResponseID.IsZero() || len(plan.Effects) == 0 {
+			return result, NewError(ErrorIntegrityFailure, "dispatch response", fmt.Errorf("effect-only plan is invalid"))
+		}
+		result.Delivery = DeliverySucceeded
+	} else {
+		delivery, err := agent.responses.Dispatch(ctx, plan.Dispatch)
+		if delivery.ActionID.IsZero() && err != nil {
+			return result, err
+		}
+		if delivery.ActionID != plan.ActionID {
+			return result, NewError(ErrorIntegrityFailure, "dispatch response", fmt.Errorf("dispatcher returned a different action ID"))
+		}
+		switch delivery.Status {
+		case DeliveryPending, DeliverySucceeded, DeliveryFailedTerminal, DeliveryUnknownOutcome:
+			result.Delivery = delivery.Status
+		default:
+			return result, NewError(ErrorIntegrityFailure, "dispatch response", fmt.Errorf("dispatcher returned an invalid delivery status"))
+		}
+		if err != nil {
+			return result, err
+		}
+	}
+	if batch, ok := agent.effects.(EffectBatchDispatcher); ok {
+		return result, batch.DispatchEffects(ctx, plan.Effects)
+	}
+	for _, ref := range plan.Effects {
+		if err := agent.effects.DispatchEffect(ctx, ref); err != nil {
+			return result, err
+		}
+	}
+	return result, nil
+}
+
+type rejectedEffectDispatcher struct{}
+
+func (rejectedEffectDispatcher) DispatchEffect(context.Context, EffectDispatchRef) error {
+	return NewError(ErrorPermissionDenied, "dispatch effect", fmt.Errorf("no effect executor is configured"))
+}
+
+func (agent *Agent) failGeneration(invocationID identity.InvocationID, generationErr error) {
+	request := FailGenerationRequest{
+		Key:          agent.key,
+		InvocationID: invocationID,
+		Code:         CodeOf(generationErr),
+		Retryable:    RetryableGeneration(generationErr),
+	}
+	// The generation error remains the primary result. A failed write leaves
+	// the turn generating, which the next claim treats as retryable.
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = agent.turns.FailGeneration(cleanupCtx, request)
+}
+
+// RetryableGeneration reports whether a failed turn may be generated again:
+// the model call failed in a way that can pass (rate limit, timeout, outage,
+// shutdown). Delivery and storage failures are not generation failures.
+func RetryableGeneration(err error) bool {
+	switch CodeOf(err) {
+	case ErrorRateLimited, ErrorTimeout, ErrorCancelled, ErrorUnavailable, ErrorProviderFailure, ErrorInternal:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateModelResult(result ModelResult, capabilities CapabilitySet, contextMessages map[string]identity.MessageID) error {
+	if !utf8.ValidString(result.Text) {
+		return Errorf(ErrorProviderFailure, "validate model result", "provider returned invalid UTF-8 text")
+	}
+	if strings.TrimSpace(result.Text) == "" && len(result.Effects) == 0 {
+		return Errorf(ErrorProviderFailure, "validate model result", "provider returned neither text nor an effect")
+	}
+	if strings.TrimSpace(result.Text) == "" && !result.ReplyToMessageID.IsZero() {
+		return Errorf(ErrorProviderFailure, "validate model result", "reply target requires text")
+	}
+	if len(result.Text) > MaxResponseBytes {
+		return Errorf(ErrorProviderFailure, "validate model result", "provider response exceeds %d bytes", MaxResponseBytes)
+	}
+	if len(result.Effects) > MaxModelEffects {
+		return Errorf(ErrorProviderFailure, "validate model result", "provider returned too many effects")
+	}
+	callIDs := make(map[string]struct{}, len(result.Effects))
+	allowedTargets := make(map[identity.MessageID]struct{}, len(contextMessages))
+	for _, messageID := range contextMessages {
+		allowedTargets[messageID] = struct{}{}
+	}
+	if !result.ReplyToMessageID.IsZero() {
+		if _, ok := allowedTargets[result.ReplyToMessageID]; !ok {
+			return Errorf(ErrorProviderFailure, "validate model result", "reply target is outside supplied history")
+		}
+	}
+	for _, planned := range result.Effects {
+		if err := planned.Validate(capabilities); err != nil {
+			return NewError(ErrorProviderFailure, "validate model result", err)
+		}
+		if !planned.Intent.TargetMessageID.IsZero() {
+			if _, ok := allowedTargets[planned.Intent.TargetMessageID]; !ok {
+				return Errorf(ErrorProviderFailure, "validate model result", "model effect target is outside supplied history")
+			}
+		}
+		for _, fileMessageID := range planned.Intent.FileMessageIDs {
+			if _, ok := allowedTargets[fileMessageID]; !ok {
+				return Errorf(ErrorProviderFailure, "validate model result", "sub-agent file is outside supplied history")
+			}
+		}
+		if _, exists := callIDs[planned.CallID]; exists {
+			return Errorf(ErrorProviderFailure, "validate model result", "provider duplicated a tool call ID")
+		}
+		callIDs[planned.CallID] = struct{}{}
+	}
+	return nil
+}
+
+func cloneInvocation(invocation Invocation) Invocation {
+	invocation.Sender = cloneSender(invocation.Sender)
+	invocation.Quote = cloneQuote(invocation.Quote)
+	invocation.Input = cloneContent(invocation.Input)
+	invocation.Mentions = cloneMentions(invocation.Mentions)
+	invocation.Capabilities = CapabilitySet{values: invocation.Capabilities.Values()}
+	invocation.Commands = append([]string(nil), invocation.Commands...)
+	invocation.Stickers = append([]string(nil), invocation.Stickers...)
+	return invocation
+}
+
+func cloneModelEffects(effects []ModelEffect) []ModelEffect {
+	cloned := append([]ModelEffect(nil), effects...)
+	for index := range cloned {
+		cloned[index].Intent.FileMessageIDs = append([]identity.MessageID(nil), cloned[index].Intent.FileMessageIDs...)
+	}
+	return cloned
+}
+
+func contextError(operation string, err error) error {
+	if err == context.DeadlineExceeded {
+		return NewError(ErrorTimeout, operation, err)
+	}
+	return NewError(ErrorCancelled, operation, err)
+}

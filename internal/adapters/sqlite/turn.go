@@ -1,0 +1,768 @@
+package sqlite
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"strings"
+	"time"
+
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/action"
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/agent"
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/effect"
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/identity"
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/policy"
+)
+
+const maxGenerationAttempts = 3
+
+func (store *TurnStore) Claim(ctx context.Context, request agent.ClaimTurnRequest) (agent.TurnClaim, error) {
+	if err := request.Key.Validate(); err != nil {
+		return agent.TurnClaim{}, err
+	}
+	if request.Invocation.ID.IsZero() || request.Now.IsZero() {
+		return agent.TurnClaim{}, agent.NewError(agent.ErrorInvalidArgument, "claim turn", errors.New("invocation ID and current time are required"))
+	}
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return agent.TurnClaim{}, storageError("begin turn claim", err)
+	}
+	defer tx.Rollback()
+	row, err := loadTurnRow(ctx, tx, request.Key, request.Invocation.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		if err := ensureScope(ctx, tx, request.Key, request.Now.UnixMilli()); err != nil {
+			return agent.TurnClaim{}, err
+		}
+		row, err = insertInvocation(ctx, tx, request)
+		if err != nil {
+			return agent.TurnClaim{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return agent.TurnClaim{}, storageError("commit turn claim", err)
+		}
+		messageID, parseErr := identity.ParseMessageID(row.messageID)
+		if parseErr != nil {
+			return agent.TurnClaim{}, agent.NewError(agent.ErrorIntegrityFailure, "decode turn message ID", parseErr)
+		}
+		return agent.TurnClaim{State: agent.TurnGenerating, MessageID: messageID}, nil
+	}
+	if err != nil {
+		return agent.TurnClaim{}, storageError("load turn claim", err)
+	}
+	if !row.claimed {
+		if !matchesPreclaimedInbound(row, request) {
+			return agent.TurnClaim{}, agent.NewError(agent.ErrorConflict, "claim received turn", errors.New("invocation does not match durable inbound message"))
+		}
+		arguments := []any{uint64(request.Invocation.PolicyVersion), uint8(agent.TurnGenerating), request.Now.UnixMilli()}
+		arguments = append(arguments, keyArgs(request.Key, request.Invocation.ID)...)
+		result, err := tx.ExecContext(ctx, `UPDATE inbound_events SET
+            turn_claimed = 1, config_version = ?, turn_state = ?, generation_attempts = generation_attempts + 1,
+            updated_at_ms = ?
+          WHERE tenant_id = ? AND account_id = ? AND chat_id = ? AND invocation_id = ? AND turn_claimed = 0`, arguments...)
+		if err != nil {
+			return agent.TurnClaim{}, storageError("claim received turn", err)
+		}
+		if changed, _ := result.RowsAffected(); changed != 1 {
+			return agent.TurnClaim{}, agent.NewError(agent.ErrorConflict, "claim received turn", errors.New("turn changed concurrently"))
+		}
+		if err := tx.Commit(); err != nil {
+			return agent.TurnClaim{}, storageError("commit received turn claim", err)
+		}
+		messageID, parseErr := identity.ParseMessageID(row.messageID)
+		if parseErr != nil {
+			return agent.TurnClaim{}, agent.NewError(agent.ErrorIntegrityFailure, "decode received message ID", parseErr)
+		}
+		return agent.TurnClaim{State: agent.TurnGenerating, MessageID: messageID}, nil
+	}
+	if row.actionID.Valid || agent.TurnState(row.state) == agent.TurnSucceeded {
+		plan, err := row.plan(request.Key, request.Invocation.ID)
+		if err != nil {
+			return agent.TurnClaim{}, err
+		}
+		plan.Effects, err = loadModelEffectRefs(ctx, tx, request.Key, request.Invocation.ID)
+		if err != nil {
+			return agent.TurnClaim{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return agent.TurnClaim{}, storageError("commit replay lookup", err)
+		}
+		messageID, parseErr := identity.ParseMessageID(row.messageID)
+		if parseErr != nil {
+			return agent.TurnClaim{}, agent.NewError(agent.ErrorIntegrityFailure, "decode replay message ID", parseErr)
+		}
+		return agent.TurnClaim{State: agent.TurnState(row.state), MessageID: messageID, Plan: &plan}, nil
+	}
+
+	nowMS := request.Now.UnixMilli()
+	switch agent.TurnState(row.state) {
+	case agent.TurnGenerating, agent.TurnFailedRetryable:
+		// One worker owns each chat, so a generating turn here was cut off by
+		// a crash or shutdown. Either way it is generated again.
+	case agent.TurnFailedTerminal:
+		return agent.TurnClaim{}, agent.NewError(agent.ErrorProviderFailure, "claim turn", errors.New("generation failed terminally"))
+	case agent.TurnUnknownOutcome:
+		return agent.TurnClaim{}, agent.NewError(agent.ErrorUnknownOutcome, "claim turn", errors.New("turn outcome is unknown"))
+	default:
+		return agent.TurnClaim{}, agent.NewError(agent.ErrorIntegrityFailure, "claim turn", errors.New("turn has invalid pre-plan state"))
+	}
+	if row.generationAttempts < 0 {
+		return agent.TurnClaim{}, agent.NewError(agent.ErrorIntegrityFailure, "claim turn", errors.New("generation attempt count is invalid"))
+	}
+	if row.generationAttempts >= maxGenerationAttempts {
+		result, err := tx.ExecContext(ctx, `UPDATE inbound_events SET
+            turn_state = ?, last_error_code = ?, updated_at_ms = ?
+          WHERE tenant_id = ? AND account_id = ? AND chat_id = ? AND invocation_id = ?
+            AND turn_state = ?`,
+			uint8(agent.TurnFailedTerminal), string(agent.ErrorProviderFailure), nowMS,
+			request.Key.TenantID.String(), request.Key.AccountID.String(), request.Key.ChatID.String(), request.Invocation.ID.String(), row.state,
+		)
+		if err := requireOne(result, err, "exhaust generation attempts"); err != nil {
+			return agent.TurnClaim{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return agent.TurnClaim{}, storageError("commit exhausted generation attempts", err)
+		}
+		return agent.TurnClaim{}, agent.NewError(agent.ErrorProviderFailure, "claim turn", errors.New("generation retry limit reached"))
+	}
+
+	result, err := tx.ExecContext(ctx, `UPDATE inbound_events SET
+        turn_state = ?, generation_attempts = generation_attempts + 1, config_version = ?,
+        last_error_code = NULL, updated_at_ms = ?
+      WHERE tenant_id = ? AND account_id = ? AND chat_id = ? AND invocation_id = ?
+        AND turn_claimed = 1 AND turn_state = ?`,
+		uint8(agent.TurnGenerating), uint64(request.Invocation.PolicyVersion), nowMS,
+		request.Key.TenantID.String(), request.Key.AccountID.String(), request.Key.ChatID.String(), request.Invocation.ID.String(),
+		row.state,
+	)
+	if err != nil {
+		return agent.TurnClaim{}, storageError("renew turn claim", err)
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return agent.TurnClaim{}, agent.NewError(agent.ErrorConflict, "renew turn claim", errors.New("turn changed concurrently"))
+	}
+	if err := tx.Commit(); err != nil {
+		return agent.TurnClaim{}, storageError("commit renewed turn claim", err)
+	}
+	messageID, parseErr := identity.ParseMessageID(row.messageID)
+	if parseErr != nil {
+		return agent.TurnClaim{}, agent.NewError(agent.ErrorIntegrityFailure, "decode renewed message ID", parseErr)
+	}
+	return agent.TurnClaim{State: agent.TurnGenerating, MessageID: messageID}, nil
+}
+
+func (store *TurnStore) CommitPlan(ctx context.Context, request agent.CommitPlanRequest) (agent.StoredPlan, error) {
+	if err := request.Key.Validate(); err != nil {
+		return agent.StoredPlan{}, err
+	}
+	if request.InvocationID.IsZero() || request.ConfigVersion == 0 ||
+		(request.ResponseText != "" && strings.TrimSpace(request.ResponseText) == "") ||
+		(strings.TrimSpace(request.ResponseText) == "" && (len(request.Effects) == 0 || !request.ReplyToMessageID.IsZero())) {
+		return agent.StoredPlan{}, agent.NewError(agent.ErrorInvalidArgument, "commit response plan", errors.New("complete response plan is required"))
+	}
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return agent.StoredPlan{}, storageError("begin response plan", err)
+	}
+	defer tx.Rollback()
+	row, err := loadTurnRow(ctx, tx, request.Key, request.InvocationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return agent.StoredPlan{}, agent.NewError(agent.ErrorNotFound, "commit response plan", errors.New("turn does not exist"))
+	}
+	if err != nil {
+		return agent.StoredPlan{}, storageError("load response plan", err)
+	}
+	if row.actionID.Valid || agent.TurnState(row.state) == agent.TurnSucceeded {
+		plan, planErr := row.plan(request.Key, request.InvocationID)
+		if planErr != nil {
+			return agent.StoredPlan{}, planErr
+		}
+		if plan.ConfigVersion != request.ConfigVersion || plan.Text != request.ResponseText || plan.ReplyToMessageID != request.ReplyToMessageID {
+			return agent.StoredPlan{}, agent.NewError(agent.ErrorConflict, "commit response plan", errors.New("different plan already exists"))
+		}
+		plan.Effects, planErr = loadModelEffectRefs(ctx, tx, request.Key, request.InvocationID)
+		if planErr != nil {
+			return agent.StoredPlan{}, planErr
+		}
+		if err := tx.Commit(); err != nil {
+			return agent.StoredPlan{}, storageError("commit response replay", err)
+		}
+		return plan, nil
+	}
+	nowMS := store.clock.Now().UTC().UnixMilli()
+	createdAt := time.UnixMilli(nowMS).UTC()
+	if agent.TurnState(row.state) != agent.TurnGenerating {
+		return agent.StoredPlan{}, agent.NewError(agent.ErrorConflict, "commit response plan", errors.New("turn is not generating"))
+	}
+	if row.configVersion.Valid && agent.ConfigVersion(row.configVersion.Int64) != request.ConfigVersion {
+		return agent.StoredPlan{}, agent.NewError(agent.ErrorConflict, "commit response plan", errors.New("config version changed"))
+	}
+	currentMessageID, err := identity.ParseMessageID(row.messageID)
+	if err != nil {
+		return agent.StoredPlan{}, agent.NewError(agent.ErrorIntegrityFailure, "decode response message ID", err)
+	}
+	if !request.CurrentMessageID.IsZero() && request.CurrentMessageID != currentMessageID {
+		return agent.StoredPlan{}, agent.NewError(agent.ErrorConflict, "commit response plan", errors.New("current message does not match claimed turn"))
+	}
+	if err := validateModelEffects(request.Effects, request.Capabilities); err != nil {
+		return agent.StoredPlan{}, err
+	}
+	if request.ResponseText == "" {
+		effectRefs, err := insertModelEffectsTx(ctx, tx, request.Key, request.InvocationID, request.Effects, nowMS)
+		if err != nil {
+			return agent.StoredPlan{}, err
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE inbound_events SET config_version = ?, turn_state = ?, updated_at_ms = ?
+      WHERE tenant_id = ? AND account_id = ? AND chat_id = ? AND invocation_id = ? AND turn_state = ?`,
+			uint64(request.ConfigVersion), uint8(agent.TurnSucceeded), nowMS,
+			request.Key.TenantID.String(), request.Key.AccountID.String(), request.Key.ChatID.String(), request.InvocationID.String(),
+			uint8(agent.TurnGenerating),
+		)
+		if err := requireOne(result, err, "publish effect-only plan"); err != nil {
+			return agent.StoredPlan{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return agent.StoredPlan{}, storageError("commit effect-only plan", err)
+		}
+		return agent.StoredPlan{
+			InvocationID: request.InvocationID, ConfigVersion: request.ConfigVersion,
+			CreatedAt: createdAt, Effects: effectRefs,
+		}, nil
+	}
+	responseID, err := identity.NewMessageID()
+	if err != nil {
+		return agent.StoredPlan{}, agent.NewError(agent.ErrorInternal, "create response ID", err)
+	}
+	actionID, err := identity.NewActionID()
+	if err != nil {
+		return agent.StoredPlan{}, agent.NewError(agent.ErrorInternal, "create action ID", err)
+	}
+	causationID, err := identity.ParseCausationID(row.causationID)
+	if err != nil {
+		return agent.StoredPlan{}, agent.NewError(agent.ErrorIntegrityFailure, "decode response causation", err)
+	}
+	var replyQuote *agent.QuoteContext
+	if !request.ReplyToMessageID.IsZero() {
+		replyQuote, err = resolveHistoryQuote(ctx, tx, request.Key, request.ReplyToMessageID)
+		if err != nil {
+			return agent.StoredPlan{}, err
+		}
+	}
+	historyEntry := agent.HistoryEntry{
+		MessageID: responseID, InvocationID: request.InvocationID,
+		Causation: agent.CausationRef{Kind: agent.CausationKind(row.causationKind), ID: causationID},
+		Role:      agent.HistoryAssistant, Quote: replyQuote,
+		Content:  []agent.ContentPart{agent.TextPart{Text: request.ResponseText}},
+		Delivery: agent.DeliveryPending, CreatedAt: createdAt,
+	}
+	if err := agent.ValidateHistoryEntry(historyEntry); err != nil {
+		return agent.StoredPlan{}, err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO outbound_actions(
+        tenant_id, account_id, chat_id, action_id, invocation_id, response_id,
+		text, state, created_at_ms, updated_at_ms, reply_to_message_id
+	      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		request.Key.TenantID.String(), request.Key.AccountID.String(), request.Key.ChatID.String(),
+		actionID.String(), request.InvocationID.String(), responseID.String(), request.ResponseText,
+		uint8(action.StatePending), nowMS, nowMS, nullableMessageID(request.ReplyToMessageID),
+	)
+	if err != nil {
+		return agent.StoredPlan{}, storageError("insert outbound action", err)
+	}
+	var quotedMessageID, quotedSequence, quotedRole, quotedSenderRef, quotedText any
+	var quotedSenderIsAdmin, quotedSenderIsSuperAdmin int
+	if historyEntry.Quote != nil {
+		quotedMessageID = historyEntry.Quote.MessageID.String()
+		if historyEntry.Quote.Sequence > 0 {
+			quotedSequence = historyEntry.Quote.Sequence
+		}
+		quotedRole = uint8(historyEntry.Quote.Role)
+		quotedText = historyEntry.Quote.Text
+		if !historyEntry.Quote.SenderRef.IsZero() {
+			quotedSenderRef = historyEntry.Quote.SenderRef.String()
+		}
+		if historyEntry.Quote.SenderIsAdmin {
+			quotedSenderIsAdmin = 1
+		}
+		if historyEntry.Quote.SenderIsSuperAdmin {
+			quotedSenderIsSuperAdmin = 1
+		}
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO history_entries(
+	        tenant_id, account_id, chat_id, message_id, invocation_id, causation_kind,
+	        causation_id, role, sender_name, quoted_message_id, quoted_sequence,
+	        quoted_role, quoted_sender_ref, quoted_text, quoted_sender_is_admin, quoted_sender_is_super_admin,
+	        content_text,
+	        delivery_status, created_at_ms, updated_at_ms
+	      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		request.Key.TenantID.String(), request.Key.AccountID.String(), request.Key.ChatID.String(),
+		responseID.String(), request.InvocationID.String(), uint8(row.causationKind), row.causationID,
+		uint8(agent.HistoryAssistant), quotedMessageID, quotedSequence, quotedRole, quotedSenderRef, quotedText,
+		quotedSenderIsAdmin, quotedSenderIsSuperAdmin,
+		request.ResponseText, uint8(agent.DeliveryPending),
+		createdAt.UnixMilli(), nowMS,
+	)
+	if err != nil {
+		return agent.StoredPlan{}, storageError("insert pending assistant history", err)
+	}
+	effectRefs, err := insertModelEffectsTx(ctx, tx, request.Key, request.InvocationID, request.Effects, nowMS)
+	if err != nil {
+		return agent.StoredPlan{}, err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE inbound_events SET config_version = ?, turn_state = ?, updated_at_ms = ?
+      WHERE tenant_id = ? AND account_id = ? AND chat_id = ? AND invocation_id = ? AND turn_state = ?`,
+		uint64(request.ConfigVersion), uint8(agent.TurnResponsePlanned), nowMS,
+		request.Key.TenantID.String(), request.Key.AccountID.String(), request.Key.ChatID.String(), request.InvocationID.String(),
+		uint8(agent.TurnGenerating),
+	)
+	if err := requireOne(result, err, "publish response plan"); err != nil {
+		return agent.StoredPlan{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return agent.StoredPlan{}, storageError("commit response plan", err)
+	}
+	return agent.StoredPlan{
+		InvocationID:     request.InvocationID,
+		ConfigVersion:    request.ConfigVersion,
+		ResponseID:       responseID,
+		ReplyToMessageID: request.ReplyToMessageID,
+		ActionID:         actionID,
+		Text:             request.ResponseText,
+		CreatedAt:        createdAt,
+		Dispatch:         agent.DispatchRef{Key: request.Key, ActionID: actionID},
+		Effects:          effectRefs,
+	}, nil
+}
+
+func resolveHistoryQuote(ctx context.Context, query actionQuerier, key agent.Key, messageID identity.MessageID) (*agent.QuoteContext, error) {
+	var sequence int64
+	var role, delivery uint8
+	var senderIsAdmin, senderIsSuperAdmin int64
+	var senderRefValue sql.NullString
+	var text string
+	err := query.QueryRowContext(ctx, `SELECT h.sequence, h.role, h.sender_ref, h.sender_is_admin, h.sender_is_super_admin, h.content_text, h.delivery_status
+	    FROM history_entries h
+	    WHERE h.tenant_id = ? AND h.account_id = ? AND h.chat_id = ? AND h.message_id = ?
+	      AND h.sequence > COALESCE((SELECT r.cutoff_sequence FROM history_resets r
+	        WHERE r.tenant_id = h.tenant_id AND r.account_id = h.account_id AND r.chat_id = h.chat_id), 0)`,
+		key.TenantID.String(), key.AccountID.String(), key.ChatID.String(), messageID.String(),
+	).Scan(&sequence, &role, &senderRefValue, &senderIsAdmin, &senderIsSuperAdmin, &text, &delivery)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, agent.NewError(agent.ErrorNotFound, "resolve reply target", errors.New("reply target is not available in the saved history"))
+	}
+	if err != nil {
+		return nil, storageError("resolve reply target", err)
+	}
+	quote := &agent.QuoteContext{
+		MessageID: messageID, Sequence: uint64(sequence), Role: agent.HistoryRole(role), Text: text,
+		SenderIsAdmin: senderIsAdmin == 1, SenderIsSuperAdmin: senderIsSuperAdmin == 1,
+	}
+	switch quote.Role {
+	case agent.HistoryUser:
+		if !senderRefValue.Valid {
+			return nil, agent.NewError(agent.ErrorIntegrityFailure, "resolve reply target", errors.New("quoted user sender is missing"))
+		}
+		ref, err := identity.ParseSenderRef(senderRefValue.String)
+		if err != nil {
+			return nil, agent.NewError(agent.ErrorIntegrityFailure, "resolve reply target", err)
+		}
+		quote.SenderRef = ref
+		bindings, err := loadMessageMentionContexts(ctx, query, key, []identity.MessageID{messageID})
+		if err != nil {
+			return nil, err
+		}
+		quote.Mentions = bindings[messageID.String()]
+	case agent.HistoryAssistant:
+		if senderRefValue.Valid || agent.DeliveryStatus(delivery) != agent.DeliverySucceeded {
+			return nil, agent.NewError(agent.ErrorNotFound, "resolve reply target", errors.New("quoted Agent message has not been sent"))
+		}
+	default:
+		return nil, agent.NewError(agent.ErrorInvalidArgument, "resolve reply target", errors.New("reply target is not a chat message"))
+	}
+	return quote, nil
+}
+
+func validateModelEffects(effects []agent.ModelEffect, capabilities agent.CapabilitySet) error {
+	if len(effects) > agent.MaxModelEffects {
+		return agent.NewError(agent.ErrorInvalidArgument, "commit response plan", errors.New("too many model effects"))
+	}
+	seen := make(map[string]struct{}, len(effects))
+	for _, planned := range effects {
+		if err := planned.Validate(capabilities); err != nil {
+			return err
+		}
+		if _, exists := seen[planned.CallID]; exists {
+			return agent.NewError(agent.ErrorInvalidArgument, "commit response plan", errors.New("effect call IDs must be unique"))
+		}
+		seen[planned.CallID] = struct{}{}
+	}
+	return nil
+}
+
+func insertModelEffectsTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	key agent.Key,
+	invocationID identity.InvocationID,
+	planned []agent.ModelEffect,
+	nowMS int64,
+) ([]agent.EffectDispatchRef, error) {
+	if len(planned) == 0 {
+		return nil, nil
+	}
+	principal, err := policy.ModelPrincipal(key, invocationID)
+	if err != nil {
+		return nil, err
+	}
+	refs := make([]agent.EffectDispatchRef, 0, len(planned))
+	for _, modelEffect := range planned {
+		effectID, err := identity.NewEffectID()
+		if err != nil {
+			return nil, agent.NewError(agent.ErrorInternal, "create model effect ID", err)
+		}
+		payload, err := modelEffectPayload(modelEffect.Intent)
+		if err != nil {
+			return nil, err
+		}
+		request := effect.PlanRequest{
+			Ref:          effect.Ref{Key: key, EffectID: effectID},
+			InvocationID: invocationID,
+			Principal:    principal,
+			Effect:       payload,
+		}
+		if err := request.Validate(); err != nil {
+			return nil, err
+		}
+		if target, targeted := effectTarget(payload); targeted {
+			if err := requireEffectTarget(ctx, tx, key, target); err != nil {
+				return nil, err
+			}
+		}
+		kind, target, encoded, err := encodeEffect(request)
+		if err != nil {
+			return nil, err
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO typed_effects(
+            tenant_id, account_id, chat_id, effect_id, invocation_id, model_call_id,
+			kind, target_message_id, payload, state, created_at_ms, updated_at_ms
+		  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			key.TenantID.String(), key.AccountID.String(), key.ChatID.String(), effectID.String(), invocationID.String(), modelEffect.CallID,
+			kind, target, encoded, uint8(effect.StatePending), nowMS, nowMS,
+		)
+		if err != nil {
+			return nil, storageError("insert model typed effect", err)
+		}
+		refs = append(refs, agent.EffectDispatchRef{Key: key, EffectID: effectID})
+	}
+	return refs, nil
+}
+
+func modelEffectPayload(intent agent.EffectIntent) (effect.Effect, error) {
+	switch intent.Kind {
+	case agent.EffectReact:
+		return effect.React{TargetMessageID: intent.TargetMessageID, Emoji: intent.Emoji}, nil
+	case agent.EffectRunCommand:
+		return effect.RunCommand{Command: intent.Command, TargetMessageID: intent.TargetMessageID}, nil
+	case agent.EffectSticker:
+		return effect.Sticker{Name: intent.Sticker, QuotedMessageID: intent.TargetMessageID, Reaction: intent.StickerReaction}, nil
+	case agent.EffectSubtask:
+		return effect.Subtask{Instruction: intent.Instruction, FileMessageIDs: append([]identity.MessageID(nil), intent.FileMessageIDs...), HighQuality: intent.HighQuality}, nil
+	default:
+		return nil, agent.NewError(agent.ErrorInvalidArgument, "convert model effect", errors.New("effect kind is invalid"))
+	}
+}
+
+type effectRowsQuerier interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func loadModelEffectRefs(ctx context.Context, query effectRowsQuerier, key agent.Key, invocationID identity.InvocationID) ([]agent.EffectDispatchRef, error) {
+	rows, err := query.QueryContext(ctx, `SELECT effect_id FROM typed_effects
+      WHERE tenant_id = ? AND account_id = ? AND chat_id = ? AND invocation_id = ? AND model_call_id IS NOT NULL
+      ORDER BY created_at_ms, effect_id`,
+		key.TenantID.String(), key.AccountID.String(), key.ChatID.String(), invocationID.String())
+	if err != nil {
+		return nil, storageError("load model typed effects", err)
+	}
+	defer rows.Close()
+	refs := make([]agent.EffectDispatchRef, 0)
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return nil, storageError("scan model typed effect", err)
+		}
+		effectID, err := identity.ParseEffectID(raw)
+		if err != nil {
+			return nil, agent.NewError(agent.ErrorIntegrityFailure, "decode model typed effect", err)
+		}
+		refs = append(refs, agent.EffectDispatchRef{Key: key, EffectID: effectID})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, storageError("iterate model typed effects", err)
+	}
+	return refs, nil
+}
+
+func (store *TurnStore) FailGeneration(ctx context.Context, request agent.FailGenerationRequest) error {
+	if err := request.Key.Validate(); err != nil {
+		return err
+	}
+	if request.InvocationID.IsZero() || request.Code == "" {
+		return agent.NewError(agent.ErrorInvalidArgument, "fail generation", errors.New("complete failure data is required"))
+	}
+	state := agent.TurnFailedTerminal
+	if request.Retryable {
+		state = agent.TurnFailedRetryable
+	}
+	result, err := store.db.ExecContext(ctx, `UPDATE inbound_events SET turn_state = ?, last_error_code = ?, updated_at_ms = ?
+      WHERE tenant_id = ? AND account_id = ? AND chat_id = ? AND invocation_id = ? AND turn_state = ?`,
+		uint8(state), string(request.Code), store.clock.Now().UnixMilli(),
+		request.Key.TenantID.String(), request.Key.AccountID.String(), request.Key.ChatID.String(), request.InvocationID.String(),
+		uint8(agent.TurnGenerating),
+	)
+	return requireOne(result, err, "record generation failure")
+}
+
+func (store *TurnStore) Load(ctx context.Context, key agent.Key, invocationID identity.InvocationID) (agent.TurnRecord, error) {
+	if err := key.Validate(); err != nil {
+		return agent.TurnRecord{}, err
+	}
+	if invocationID.IsZero() {
+		return agent.TurnRecord{}, agent.NewError(agent.ErrorInvalidArgument, "load turn", errors.New("invocation ID is required"))
+	}
+	row, err := loadTurnRow(ctx, store.read, key, invocationID)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && !row.claimed) {
+		return agent.TurnRecord{}, agent.NewError(agent.ErrorNotFound, "load turn", errors.New("claimed turn does not exist"))
+	}
+	if err != nil {
+		return agent.TurnRecord{}, storageError("load turn", err)
+	}
+	record := agent.TurnRecord{
+		Key:          key,
+		InvocationID: invocationID,
+		State:        agent.TurnState(row.state),
+		Delivery:     row.delivery(),
+		UpdatedAt:    time.UnixMilli(row.updatedAt).UTC(),
+	}
+	messageID, parseErr := identity.ParseMessageID(row.messageID)
+	if parseErr != nil {
+		return agent.TurnRecord{}, agent.NewError(agent.ErrorIntegrityFailure, "decode turn message ID", parseErr)
+	}
+	record.MessageID = messageID
+	if row.actionID.Valid || agent.TurnState(row.state) == agent.TurnSucceeded {
+		plan, err := row.plan(key, invocationID)
+		if err != nil {
+			return agent.TurnRecord{}, err
+		}
+		plan.Effects, err = loadModelEffectRefs(ctx, store.read, key, invocationID)
+		if err != nil {
+			return agent.TurnRecord{}, err
+		}
+		record.Plan = &plan
+	}
+	return record, nil
+}
+
+type turnRow struct {
+	state              int64
+	claimed            bool
+	messageID          string
+	providerMessageID  sql.NullString
+	invocationCause    int64
+	causationKind      int64
+	causationID        string
+	participantID      sql.NullString
+	senderRef          sql.NullString
+	senderName         string
+	inputText          string
+	occurredAt         int64
+	generationAttempts int64
+	configVersion      sql.NullInt64
+	responseID         sql.NullString
+	actionID           sql.NullString
+	responseText       sql.NullString
+	actionState        sql.NullInt64
+	updatedAt          int64
+	responseCreatedAt  sql.NullInt64
+	replyToMessageID   sql.NullString
+}
+
+type turnQuerier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func loadTurnRow(ctx context.Context, query turnQuerier, key agent.Key, invocationID identity.InvocationID) (turnRow, error) {
+	var row turnRow
+	err := query.QueryRowContext(ctx, `SELECT i.turn_state, i.turn_claimed, i.message_id, i.provider_message_id,
+        i.invocation_cause, i.causation_kind, i.causation_id, i.participant_id, i.sender_ref, i.sender_name, i.input_text, i.occurred_at_ms,
+        i.generation_attempts, i.config_version, a.response_id, a.action_id,
+	        a.text, a.state, i.updated_at_ms, a.created_at_ms, a.reply_to_message_id
+      FROM inbound_events i
+      LEFT JOIN outbound_actions a ON a.tenant_id = i.tenant_id AND a.account_id = i.account_id
+        AND a.chat_id = i.chat_id AND a.invocation_id = i.invocation_id
+      WHERE i.tenant_id = ? AND i.account_id = ? AND i.chat_id = ? AND i.invocation_id = ?`,
+		key.TenantID.String(), key.AccountID.String(), key.ChatID.String(), invocationID.String(),
+	).Scan(&row.state, &row.claimed, &row.messageID, &row.providerMessageID, &row.invocationCause, &row.causationKind,
+		&row.causationID, &row.participantID, &row.senderRef,
+		&row.senderName, &row.inputText, &row.occurredAt, &row.generationAttempts,
+		&row.configVersion, &row.responseID, &row.actionID, &row.responseText, &row.actionState, &row.updatedAt, &row.responseCreatedAt, &row.replyToMessageID)
+	return row, err
+}
+
+func matchesPreclaimedInbound(row turnRow, request agent.ClaimTurnRequest) bool {
+	invocation := request.Invocation
+	if !row.providerMessageID.Valid || invocation.Cause != agent.CauseInboundMessage ||
+		int64(invocation.Cause) != row.invocationCause || int64(invocation.Causation.Kind) != row.causationKind ||
+		invocation.Causation.Kind != agent.CausationMessage || row.causationID != invocation.Causation.ID.String() ||
+		invocation.Sender == nil || !row.participantID.Valid || !row.senderRef.Valid ||
+		row.participantID.String != invocation.Sender.ParticipantID.String() ||
+		row.senderRef.String != invocation.Sender.Ref.String() || row.senderName != invocation.Sender.DisplayName ||
+		row.inputText != flattenText(invocation.Input) || row.occurredAt != invocation.RequestedAt.UnixMilli() {
+		return false
+	}
+	return true
+}
+
+func insertInvocation(ctx context.Context, tx *sql.Tx, request agent.ClaimTurnRequest) (turnRow, error) {
+	messageID, err := identity.NewMessageID()
+	if err != nil {
+		return turnRow{}, agent.NewError(agent.ErrorInternal, "create turn message ID", err)
+	}
+	inputText := flattenText(request.Invocation.Input)
+	var participant, senderRef any
+	senderName := ""
+	if request.Invocation.Sender != nil {
+		if err := ensureInternalSender(ctx, tx, request.Key, *request.Invocation.Sender, request.Now.UnixMilli()); err != nil {
+			return turnRow{}, err
+		}
+		participant = request.Invocation.Sender.ParticipantID.String()
+		senderRef = request.Invocation.Sender.Ref.String()
+		senderName = request.Invocation.Sender.DisplayName
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO inbound_events(
+        tenant_id, account_id, chat_id, invocation_id, message_id, invocation_cause, causation_kind, causation_id,
+        participant_id, sender_ref, sender_name, input_text, occurred_at_ms, received_at_ms,
+        turn_claimed, config_version, turn_state, generation_attempts, updated_at_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+		request.Key.TenantID.String(), request.Key.AccountID.String(), request.Key.ChatID.String(),
+		request.Invocation.ID.String(), messageID.String(), uint8(request.Invocation.Cause), uint8(request.Invocation.Causation.Kind), request.Invocation.Causation.ID.String(),
+		participant, senderRef, senderName, inputText, request.Invocation.RequestedAt.UnixMilli(), request.Now.UnixMilli(),
+		1, uint64(request.Invocation.PolicyVersion), uint8(agent.TurnGenerating), request.Now.UnixMilli(),
+	)
+	if err != nil {
+		return turnRow{}, storageError("insert turn claim", err)
+	}
+	return turnRow{messageID: messageID.String(), invocationCause: int64(request.Invocation.Cause),
+		causationKind: int64(request.Invocation.Causation.Kind), causationID: request.Invocation.Causation.ID.String(),
+		claimed: true}, nil
+}
+
+func ensureInternalSender(ctx context.Context, tx *sql.Tx, key agent.Key, sender agent.SenderContext, nowMS int64) error {
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO participants(
+        tenant_id, account_id, id, created_at_ms
+      ) VALUES (?, ?, ?, ?)`,
+		key.TenantID.String(), key.AccountID.String(), sender.ParticipantID.String(), nowMS,
+	); err != nil {
+		return storageError("ensure invocation participant", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO sender_refs(
+        tenant_id, account_id, chat_id, participant_id, sender_ref, created_at_ms
+      ) VALUES (?, ?, ?, ?, ?, ?)`,
+		key.TenantID.String(), key.AccountID.String(), key.ChatID.String(),
+		sender.ParticipantID.String(), sender.Ref.String(), nowMS,
+	); err != nil {
+		return storageError("ensure invocation sender ref", err)
+	}
+	if err := updateSenderDisplayName(ctx, tx, key.TenantID, key.AccountID, key.ChatID, sender.Ref, sender.DisplayName, false); err != nil {
+		return err
+	}
+	var storedRef string
+	err := tx.QueryRowContext(ctx, `SELECT sender_ref FROM sender_refs
+      WHERE tenant_id = ? AND account_id = ? AND chat_id = ? AND participant_id = ?`,
+		key.TenantID.String(), key.AccountID.String(), key.ChatID.String(), sender.ParticipantID.String(),
+	).Scan(&storedRef)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && storedRef != sender.Ref.String()) {
+		return agent.NewError(agent.ErrorConflict, "ensure invocation sender ref", errors.New("participant and sender ref are bound to different identities"))
+	}
+	if err != nil {
+		return storageError("verify invocation sender ref", err)
+	}
+	return nil
+}
+
+func (row turnRow) plan(key agent.Key, invocationID identity.InvocationID) (agent.StoredPlan, error) {
+	if agent.TurnState(row.state) == agent.TurnSucceeded && !row.actionID.Valid {
+		if !row.configVersion.Valid {
+			return agent.StoredPlan{}, agent.NewError(agent.ErrorIntegrityFailure, "decode effect-only plan", errors.New("partial effect-only plan"))
+		}
+		return agent.StoredPlan{
+			InvocationID: invocationID, ConfigVersion: agent.ConfigVersion(row.configVersion.Int64),
+			CreatedAt: time.UnixMilli(row.updatedAt).UTC(),
+		}, nil
+	}
+	if !row.configVersion.Valid || !row.responseID.Valid || !row.actionID.Valid || !row.responseText.Valid || !row.responseCreatedAt.Valid {
+		return agent.StoredPlan{}, agent.NewError(agent.ErrorIntegrityFailure, "decode response plan", errors.New("partial response plan"))
+	}
+	responseID, err := identity.ParseMessageID(row.responseID.String)
+	if err != nil {
+		return agent.StoredPlan{}, agent.NewError(agent.ErrorIntegrityFailure, "decode response plan", err)
+	}
+	actionID, err := identity.ParseActionID(row.actionID.String)
+	if err != nil {
+		return agent.StoredPlan{}, agent.NewError(agent.ErrorIntegrityFailure, "decode response plan", err)
+	}
+	var replyTo identity.MessageID
+	if row.replyToMessageID.Valid {
+		replyTo, err = identity.ParseMessageID(row.replyToMessageID.String)
+		if err != nil {
+			return agent.StoredPlan{}, agent.NewError(agent.ErrorIntegrityFailure, "decode response plan", err)
+		}
+	}
+	return agent.StoredPlan{
+		InvocationID:     invocationID,
+		ConfigVersion:    agent.ConfigVersion(row.configVersion.Int64),
+		ResponseID:       responseID,
+		ReplyToMessageID: replyTo,
+		ActionID:         actionID,
+		Text:             row.responseText.String,
+		CreatedAt:        time.UnixMilli(row.responseCreatedAt.Int64).UTC(),
+		Dispatch:         agent.DispatchRef{Key: key, ActionID: actionID},
+	}, nil
+}
+
+// delivery derives the turn's delivery status from its reply, if any. A
+// succeeded turn without a reply is an effect-only turn and counts as sent.
+func (row turnRow) delivery() agent.DeliveryStatus {
+	if !row.actionState.Valid {
+		if agent.TurnState(row.state) == agent.TurnSucceeded {
+			return agent.DeliverySucceeded
+		}
+		return agent.DeliveryNotStarted
+	}
+	switch action.State(row.actionState.Int64) {
+	case action.StateSucceeded:
+		return agent.DeliverySucceeded
+	case action.StateFailedTerminal:
+		return agent.DeliveryFailedTerminal
+	case action.StateUnknownOutcome:
+		return agent.DeliveryUnknownOutcome
+	default:
+		return agent.DeliveryPending
+	}
+}
+
+func flattenText(parts []agent.ContentPart) string {
+	var builder strings.Builder
+	for index, part := range parts {
+		if index > 0 {
+			builder.WriteString("\n")
+		}
+		if text, ok := part.(agent.TextPart); ok {
+			builder.WriteString(text.Text)
+		}
+	}
+	return builder.String()
+}
+
+func keyArgs(key agent.Key, invocationID identity.InvocationID) []any {
+	return []any{key.TenantID.String(), key.AccountID.String(), key.ChatID.String(), invocationID.String()}
+}

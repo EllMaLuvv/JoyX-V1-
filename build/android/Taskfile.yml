@@ -1,0 +1,87 @@
+version: '3'
+
+includes:
+  common: ../Taskfile.yml
+
+vars:
+  MIN_SDK: '21'
+
+tasks:
+  overlay:generate:
+    summary: Register the Android entrypoint in the cmd/app package
+    dir: '{{.ROOT_DIR}}/cmd/app'
+    cmds:
+      - wails3 android overlay:gen -out "{{.ROOT_DIR}}/build/android/overlay.json" -config "{{.ROOT_DIR}}/build/config.yml"
+
+  toolchain:check:
+    summary: Check the Android SDK, NDK, Java, and supported build host
+    cmds:
+      - wails3 doctor
+      - |
+        case "{{OS}}" in
+          linux|darwin) ;;
+          *) echo 'The pinned Wails Android compiler task needs Linux or macOS (WSL is supported with a Linux SDK/NDK).'; exit 1 ;;
+        esac
+        command -v java >/dev/null || { echo 'JDK is required'; exit 1; }
+        SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+        [ -d "$SDK_ROOT" ] || { echo 'Set ANDROID_HOME to the Android SDK'; exit 1; }
+        [ -d "$SDK_ROOT/platforms/android-35" ] || { echo 'Install Android SDK platform 35'; exit 1; }
+        [ -d "$SDK_ROOT/build-tools" ] || { echo 'Install Android build-tools'; exit 1; }
+        NDK_ROOT="${ANDROID_NDK_HOME:-$(ls -d "$SDK_ROOT"/ndk/* 2>/dev/null | sort -V | tail -1)}"
+        [ -d "$NDK_ROOT" ] || { echo 'Install Android NDK 26.3.11579264 or set ANDROID_NDK_HOME'; exit 1; }
+
+  compile:go:
+    internal: true
+    summary: Compile the shared Go backend for one Android ABI
+    dir: '{{.ROOT_DIR}}'
+    cmds:
+      - |
+        SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+        NDK_ROOT="${ANDROID_NDK_HOME:-$(ls -d "$SDK_ROOT"/ndk/* 2>/dev/null | sort -V | tail -1)}"
+        case "{{OS}}" in
+          linux) HOST_TAG=linux-x86_64 ;;
+          darwin) HOST_TAG=darwin-x86_64 ;;
+          *) echo 'Android cross compilation requires Linux or macOS'; exit 1 ;;
+        esac
+        TOOLCHAIN="$NDK_ROOT/toolchains/llvm/prebuilt/$HOST_TAG/bin"
+        case "{{.ARCH | default "arm64"}}" in
+          arm64) GOARCH=arm64; ABI=arm64-v8a; TARGET=aarch64-linux-android ;;
+          amd64) GOARCH=amd64; ABI=x86_64; TARGET=x86_64-linux-android ;;
+          *) echo 'ARCH must be arm64 or amd64'; exit 1 ;;
+        esac
+        CC="$TOOLCHAIN/${TARGET}{{.MIN_SDK}}-clang"
+        CXX="$TOOLCHAIN/${TARGET}{{.MIN_SDK}}-clang++"
+        [ -x "$CC" ] || { echo "NDK compiler missing: $CC"; exit 1; }
+        mkdir -p "build/android/app/src/main/jniLibs/$ABI"
+        GOOS=android GOARCH="$GOARCH" CGO_ENABLED=1 CC="$CC" CXX="$CXX" \
+          go build -buildmode=c-shared -overlay "{{.ROOT_DIR}}/build/android/overlay.json" \
+          -tags 'gui,android,{{.FLAVOR | default "debug"}}' -buildvcs=false \
+          -o "build/android/app/src/main/jniLibs/$ABI/libwails.so" ./cmd/app
+
+  build:
+    summary: Build an Android debug APK for a device or emulator
+    dir: '{{.ROOT_DIR}}'
+    cmds:
+      - task: toolchain:check
+      - task: overlay:generate
+      - task: common:generate:bindings:android
+      - task: common:build:frontend
+      - task: compile:go
+        vars:
+          ARCH: '{{.ARCH | default "arm64"}}'
+          FLAVOR: debug
+      - cd build/android && chmod +x ./gradlew && ./gradlew assembleDebug
+
+  package:
+    summary: Build an Android release APK for local testing
+    dir: '{{.ROOT_DIR}}'
+    cmds:
+      - task: toolchain:check
+      - task: overlay:generate
+      - task: common:generate:bindings:android
+      - task: common:build:frontend
+      - task: compile:go
+        vars:
+          ARCH: '{{.ARCH | default "arm64"}}'
+          FLAVOR: production
+      - cd build/android && chmod +x ./gradlew && ./gradlew assembleRelease

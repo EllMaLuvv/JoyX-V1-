@@ -1,0 +1,146 @@
+package agent
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/identity"
+)
+
+type TurnState uint8
+
+const (
+	TurnGenerating TurnState = iota + 1
+	TurnFailedRetryable
+	TurnResponsePlanned
+	TurnDeliveryPending
+	TurnSucceeded
+	TurnFailedTerminal
+	TurnUnknownOutcome
+)
+
+type DeliveryStatus uint8
+
+const (
+	DeliveryNotStarted DeliveryStatus = iota
+	DeliveryPending
+	DeliverySucceeded
+	DeliveryFailedTerminal
+	DeliveryUnknownOutcome
+)
+
+type ClaimTurnRequest struct {
+	Key        Key
+	Invocation Invocation
+	Now        time.Time
+}
+
+type TurnClaim struct {
+	State     TurnState
+	MessageID identity.MessageID
+	Plan      *StoredPlan
+}
+
+type CommitPlanRequest struct {
+	Key              Key
+	InvocationID     identity.InvocationID
+	CurrentMessageID identity.MessageID
+	ConfigVersion    ConfigVersion
+	ResponseText     string
+	ReplyToMessageID identity.MessageID
+	Capabilities     CapabilitySet
+	Effects          []ModelEffect
+}
+
+type FailGenerationRequest struct {
+	Key          Key
+	InvocationID identity.InvocationID
+	Code         ErrorCode
+	Retryable    bool
+}
+
+type DispatchRef struct {
+	Key      Key
+	ActionID identity.ActionID
+}
+
+type StoredPlan struct {
+	InvocationID     identity.InvocationID
+	ConfigVersion    ConfigVersion
+	ResponseID       identity.MessageID
+	ReplyToMessageID identity.MessageID
+	ActionID         identity.ActionID
+	Text             string
+	CreatedAt        time.Time
+	Dispatch         DispatchRef
+	Effects          []EffectDispatchRef
+}
+
+type EffectDispatchRef struct {
+	Key      Key
+	EffectID identity.EffectID
+}
+
+func (ref EffectDispatchRef) Validate() error {
+	if err := ref.Key.Validate(); err != nil || ref.EffectID.IsZero() {
+		return NewError(ErrorInvalidArgument, "validate effect dispatch reference", fmt.Errorf("agent key and effect ID are required"))
+	}
+	return nil
+}
+
+type TurnRecord struct {
+	Key          Key
+	InvocationID identity.InvocationID
+	MessageID    identity.MessageID
+	State        TurnState
+	Plan         *StoredPlan
+	Delivery     DeliveryStatus
+	UpdatedAt    time.Time
+}
+
+type TurnStore interface {
+	Claim(context.Context, ClaimTurnRequest) (TurnClaim, error)
+	CommitPlan(context.Context, CommitPlanRequest) (StoredPlan, error)
+	FailGeneration(context.Context, FailGenerationRequest) error
+	Load(context.Context, Key, identity.InvocationID) (TurnRecord, error)
+}
+
+type DeliveryResult struct {
+	ActionID    identity.ActionID
+	Status      DeliveryStatus
+	CompletedAt *time.Time
+}
+
+type ResponseDispatcher interface {
+	Dispatch(context.Context, DispatchRef) (DeliveryResult, error)
+}
+
+type EffectDispatcher interface {
+	DispatchEffect(context.Context, EffectDispatchRef) error
+}
+
+// EffectBatchDispatcher is an EffectDispatcher that dispatches one plan's
+// effects together, in order, stopping at the first error, so it can report
+// them together.
+type EffectBatchDispatcher interface {
+	DispatchEffects(context.Context, []EffectDispatchRef) error
+}
+
+type InvokeResult struct {
+	InvocationID  identity.InvocationID
+	ConfigVersion ConfigVersion
+	ResponseID    identity.MessageID
+	ActionID      identity.ActionID
+	Text          string
+	Delivery      DeliveryStatus
+}
+
+func clonePlan(plan *StoredPlan) *StoredPlan {
+	if plan == nil {
+		return nil
+	}
+	copyPlan := *plan
+	copyPlan.Effects = append([]EffectDispatchRef(nil), plan.Effects...)
+	return &copyPlan
+}

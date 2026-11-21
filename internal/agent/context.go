@@ -1,0 +1,676 @@
+package agent
+
+import (
+	"fmt"
+	"regexp"
+	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/identity"
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/mention"
+)
+
+const (
+	DefaultHistoryWindow    = 64
+	DefaultMaxContextBytes  = 64 * 1024
+	MaxContextBytes         = 1024 * 1024
+	compactContextIDModulus = 1_000_000
+	defaultPromptOverride   = "No prompt override is provided here. Follow your default behavior."
+)
+
+var (
+	historyBoundaryPattern = regexp.MustCompile(`(?i)</?untrusted_chat_history\s*>`)
+	escapeTagDelimiters    = strings.NewReplacer("<", "&lt;", ">", "&gt;")
+)
+
+type ContextBuildRequest struct {
+	Config              ConfigSnapshot
+	Chat                ChatContext
+	History             []HistoryEntry
+	CurrentInvocationID identity.InvocationID
+}
+
+// ChatContext is the provider-neutral, read-only chat metadata shown to the
+// model. It is not an authorization decision; effects still recheck authority.
+type ChatContext struct {
+	Kind        string
+	Name        string
+	Description string
+	BotIsAdmin  bool
+	// Tasks are the chat's pending one-off and daily tasks, soonest first.
+	Tasks []ScheduledTaskSummary
+	// Memories are the chat's long-term memories (/memory), oldest first.
+	Memories []Memory
+	// Stickers are the names in the chat's sticker catalog, sorted.
+	Stickers []string
+	// Location is the bot's time zone. Message times, task times and daily
+	// tasks all use it; nil means UTC.
+	Location *time.Location
+	// Subagent is set for chats whose sub-agent is on; it adds the
+	// <subagent> block to the model's context.
+	Subagent *SubagentContext
+}
+
+func (chat ChatContext) location() *time.Location {
+	if chat.Location == nil {
+		return time.UTC
+	}
+	return chat.Location
+}
+
+// utcOffset writes the offset of t's zone as "UTC+07:00", or "UTC".
+func utcOffset(t time.Time) string {
+	if _, offset := t.Zone(); offset == 0 {
+		return "UTC"
+	}
+	return "UTC" + t.Format("-07:00")
+}
+
+// ScheduledTaskSummary is one /schedule-task or /daily-task entry as the
+// model sees it in <chat_state>.
+type ScheduledTaskSummary struct {
+	// Code is the short ID the delete commands take.
+	Code string
+	// FireAt is the next run, shown in the bot's time zone.
+	FireAt time.Time
+	Daily  bool
+	Prompt string
+}
+
+func (chat ChatContext) Validate() error {
+	if chat.Kind != "group" && chat.Kind != "private" {
+		return fmt.Errorf("chat kind must be group or private")
+	}
+	if !utf8.ValidString(chat.Name) || !utf8.ValidString(chat.Description) ||
+		len(chat.Name) > 512 || len(chat.Description) > 4096 {
+		return fmt.Errorf("chat metadata is invalid")
+	}
+	if chat.Kind == "private" && chat.BotIsAdmin {
+		return fmt.Errorf("private chat cannot have group admin role")
+	}
+	return nil
+}
+
+type ContextBuilder interface {
+	Build(ContextBuildRequest) ([]ModelMessage, error)
+}
+
+type DeterministicContextBuilder struct {
+	maxBytes      uint32
+	assistantName string
+}
+
+func NewDeterministicContextBuilder(maxBytes uint32, assistantName string) (*DeterministicContextBuilder, error) {
+	if maxBytes == 0 || maxBytes > MaxContextBytes {
+		return nil, NewError(ErrorInvalidArgument, "create context builder", fmt.Errorf("max context bytes must be between 1 and %d", MaxContextBytes))
+	}
+	if assistantName == "" || cleanMentionName(assistantName) != assistantName {
+		return nil, NewError(ErrorInvalidArgument, "create context builder", fmt.Errorf("assistant name is invalid for bot mentions"))
+	}
+	return &DeterministicContextBuilder{maxBytes: maxBytes, assistantName: assistantName}, nil
+}
+
+func (builder *DeterministicContextBuilder) Build(request ContextBuildRequest) ([]ModelMessage, error) {
+	if builder == nil || request.CurrentInvocationID.IsZero() {
+		return nil, NewError(ErrorInvalidArgument, "build model context", fmt.Errorf("builder and current invocation ID are required"))
+	}
+	if err := validateConfigSnapshot(request.Config); err != nil {
+		return nil, NewError(ErrorIntegrityFailure, "build model context", err)
+	}
+	if err := request.Chat.Validate(); err != nil {
+		return nil, NewError(ErrorIntegrityFailure, "build model context", err)
+	}
+	// Model history is intentionally one logical user block. The transcript
+	// renderer is compact and already carries role/sender/quote markers, so
+	// turning every durable entry into a provider message wastes tokens and
+	// changes the compact prompt shape selected for this project.
+	messages := make([]ModelMessage, 0, 4)
+	// The configured chat prompt fills the system policy's <additional> block.
+	// A /prompt override goes in <prompt_override>; replace mode also drops the
+	// configured chat prompt.
+	additionalPrompt := request.Config.Prompt
+	promptOverride := defaultPromptOverride
+	if request.Config.PromptOverride != nil {
+		promptOverride = replaceReservedContextBrackets(request.Config.PromptOverride.Text)
+		if request.Config.PromptOverride.Mode == PromptReplace {
+			additionalPrompt = ""
+		}
+	}
+	messages = append(messages, ModelMessage{
+		Role: ModelSystem, Provenance: ProvenanceBasePrompt, AdditionalPrompt: additionalPrompt,
+	})
+	messages = append(messages, ModelMessage{
+		Role: ModelUser, Provenance: ProvenancePromptOverride,
+		Content: "<prompt_override>\n" + promptOverride + "\n</prompt_override>",
+	})
+	messages = append(messages, ModelMessage{
+		Role: ModelUser, Provenance: ProvenanceChatInformation,
+		Content: formatChatInformation(request.Chat, request.Config.Permission.ModerationLevel),
+	})
+	messages = append(messages, ModelMessage{
+		Role: ModelUser, Provenance: ProvenanceChatState,
+		Content: formatChatState(request.Chat, request.Config),
+	})
+	if request.Chat.Subagent != nil {
+		messages = append(messages, ModelMessage{
+			Role: ModelUser, Provenance: ProvenanceSubagent,
+			Content: formatSubagentContext(*request.Chat.Subagent, request.History, builder.assistantName),
+		})
+	}
+	type builtHistoryEntry struct {
+		rendered     string
+		invocationID identity.InvocationID
+		current      bool
+		role         HistoryRole
+	}
+	instructions := append([]ModelMessage(nil), messages...)
+	historyEntries := make([]builtHistoryEntry, 0, len(request.History))
+	mentionNames := historyDisplayNames(request.History)
+	currentFound := false
+	for _, entry := range request.History {
+		if err := ValidateHistoryEntry(entry); err != nil {
+			return nil, err
+		}
+		if entry.Role == HistoryAssistant && entry.Delivery != DeliverySucceeded {
+			continue
+		}
+		current := entry.InvocationID == request.CurrentInvocationID
+		if current {
+			if entry.Role == HistoryAssistant || currentFound {
+				return nil, NewError(ErrorIntegrityFailure, "build model context", fmt.Errorf("current invocation history is ambiguous"))
+			}
+			currentFound = true
+		}
+		rendered, err := serializeHistoryEntry(entry, mentionNames, builder.assistantName, request.Chat.location())
+		if err != nil {
+			return nil, err
+		}
+		historyEntries = append(historyEntries, builtHistoryEntry{
+			rendered: rendered, invocationID: entry.InvocationID, current: current, role: entry.Role,
+		})
+	}
+	if !currentFound {
+		return nil, NewError(ErrorIntegrityFailure, "build model context", fmt.Errorf("current user history is missing"))
+	}
+	if len(historyEntries) == 0 || !historyEntries[len(historyEntries)-1].current {
+		return nil, NewError(ErrorConflict, "build model context", fmt.Errorf("newer chat context exists; retry in chat order"))
+	}
+	for {
+		messages = append(messages[:0], instructions...)
+		rendered := make([]string, 0, len(historyEntries)+3)
+		burstStart := 0
+		for index, entry := range historyEntries {
+			if entry.role == HistoryAssistant {
+				burstStart = index + 1
+			}
+		}
+		rendered = append(rendered, "older messages:")
+		for _, entry := range historyEntries[:burstStart] {
+			rendered = append(rendered, entry.rendered)
+		}
+		rendered = append(rendered, "current messages(burst):")
+		for _, entry := range historyEntries[burstStart:] {
+			rendered = append(rendered, entry.rendered)
+		}
+		transcript := wrapUntrustedChatHistory(strings.Join(rendered, "\n\n"))
+		messages = append(messages, ModelMessage{
+			Role:       ModelUser,
+			Provenance: ProvenanceHistoryTranscript,
+			Content:    transcript,
+		})
+		if modelMessagesBytes(messages) <= int(builder.maxBytes) {
+			return cloneModelMessages(messages), nil
+		}
+		if len(historyEntries) <= 1 {
+			return nil, NewError(ErrorResourceExhausted, "build model context", fmt.Errorf("trusted prompts and current message exceed context byte limit"))
+		}
+		// Preserve trusted instructions and the current user entry. Remove every
+		// message of the oldest logical invocation together so trimming cannot
+		// leave an orphan assistant response or partial UTF-8/identity envelope.
+		oldest := historyEntries[0].invocationID
+		retained := make([]builtHistoryEntry, 0, len(historyEntries)-1)
+		for _, entry := range historyEntries {
+			if entry.invocationID != oldest {
+				retained = append(retained, entry)
+			}
+		}
+		if len(retained) == len(historyEntries) {
+			return nil, NewError(ErrorIntegrityFailure, "build model context", fmt.Errorf("history trimming made no progress"))
+		}
+		historyEntries = retained
+	}
+}
+
+func wrapUntrustedChatHistory(transcript string) string {
+	// Keep transcript text from forging a closing wrapper and making following
+	// user content appear to sit outside the untrusted boundary.
+	transcript = historyBoundaryPattern.ReplaceAllStringFunc(transcript, escapeTagDelimiters.Replace)
+	return "<untrusted_chat_history>\n" + transcript + "\n</untrusted_chat_history>"
+}
+
+func formatChatInformation(chat ChatContext, level ModerationLevel) string {
+	name := sanitizeContextMetadata(chat.Name)
+	description := sanitizeContextMetadata(chat.Description)
+	if name == "" {
+		name = "(unnamed group)"
+	}
+	if description == "" {
+		description = "(none)"
+	}
+	lines := []string{"Chat information:"}
+	if chat.Kind == "group" {
+		lines = append(lines, "- Group name: "+name, "- Group description: "+description)
+	} else {
+		lines = append(lines, "- Chat name: (private chat)")
+	}
+	role := "regular member"
+	if chat.Kind == "group" && chat.BotIsAdmin {
+		role = "admin"
+	}
+	capabilities := "none"
+	effectiveLevel := ModerationNone
+	if chat.Kind == "group" && chat.BotIsAdmin {
+		effectiveLevel = level
+		switch level {
+		case ModerationDelete:
+			capabilities = "delete messages"
+		case ModerationDeleteMute:
+			capabilities = "delete messages, mute members"
+		case ModerationDeleteMuteKick:
+			capabilities = "delete messages, mute members, kick members"
+		}
+	}
+	lines = append(lines,
+		"- Chat state: "+chat.Kind,
+		"- Bot role: "+role,
+		fmt.Sprintf("- Bot moderation permission: %d", effectiveLevel),
+		"- Bot moderation capabilities: "+capabilities+" (configured maximum; command permissions apply separately)",
+	)
+	return strings.Join(lines, "\n")
+}
+
+// formatChatState describes this chat's settings and scheduled tasks, each
+// with the command that changes it, so the model can explain them and change
+// them when asked.
+func formatChatState(chat ChatContext, config ConfigSnapshot) string {
+	lines := []string{"<chat_state>",
+		"Who may change each item, and when you may on your own, is in <chat_settings>.",
+		"Settings of this chat (the command in brackets changes it):"}
+	if chat.Kind == "group" {
+		triggers := config.Triggers
+		lines = append(lines, fmt.Sprintf("- Triggers [/trigger]: mention %s, name %s, reply to bot %s, smart %s",
+			onOff(triggers.Mention), onOff(triggers.Name), onOff(triggers.Reply), onOff(triggers.Smart)))
+		if triggers.Name && triggers.NameRegex {
+			lines = append(lines, "  Name regex: "+sanitizeContextMetadata(triggers.NamePattern))
+		}
+		if rules := triggers.SmartRuleList(); len(rules) > 0 {
+			header := "  Group admin rules (a message matching one wakes you; your memory note for it says what to do):"
+			if !triggers.Smart {
+				header = "  Group admin rules (inactive while smart is off; when active, a message matching one wakes you, and your memory note for it says what to do):"
+			}
+			lines = append(lines, header)
+			for index, rule := range rules {
+				lines = append(lines, fmt.Sprintf("  %d. %s", index+1, sanitizeContextMetadata(rule)))
+			}
+		}
+		lines = append(lines, fmt.Sprintf("- Moderation level [/permission]: %d (%s)", config.Permission.ModerationLevel, moderationCapabilities(config.Permission.ModerationLevel)))
+	}
+	custom := "none"
+	if config.PromptOverride != nil {
+		custom = "set, appended to the chat prompt"
+		if config.PromptOverride.Mode == PromptReplace {
+			custom = "set, replacing the chat prompt"
+		}
+	}
+	lines = append(lines, "- Custom instructions [/prompt]: "+custom+" (the text is in <prompt_override>)")
+	stickers := "none"
+	if len(chat.Stickers) > 0 {
+		stickers = strings.Join(chat.Stickers, ", ")
+	}
+	lines = append(lines, "- Sticker catalog [/add-sticker, /remove-sticker]: "+stickers)
+	var once, daily []string
+	location := chat.location()
+	for _, task := range chat.Tasks {
+		prompt := sanitizeContextMetadata(task.Prompt)
+		if task.Daily {
+			daily = append(daily, "- ["+task.Code+"] every day at "+task.FireAt.In(location).Format("15:04")+": "+prompt)
+		} else {
+			once = append(once, "- ["+task.Code+"] "+task.FireAt.In(location).Format("2006-01-02 15:04")+": "+prompt)
+		}
+	}
+	lines = append(lines, "Times here and in the chat transcript are in the bot's time zone, "+utcOffset(time.Now().In(location))+".")
+	lines = append(lines, "One-off tasks [/schedule-task], open to everyone; [ID] then time:")
+	lines = append(lines, orNone(once)...)
+	lines = append(lines, "Daily tasks [/daily-task], [ID] then time:")
+	lines = append(lines, orNone(daily)...)
+	var memories []string
+	for _, memory := range chat.Memories {
+		memories = append(memories, "- ["+memory.Code+"] "+sanitizeContextMetadata(memory.Text))
+	}
+	lines = append(lines, fmt.Sprintf("Long-term memory [/memory], your own notes on this chat (%d/%d), [ID] then note:", len(memories), MaxMemories))
+	lines = append(lines, orNone(memories)...)
+	lines = append(lines, "</chat_state>")
+	return strings.Join(lines, "\n")
+}
+
+func orNone(lines []string) []string {
+	if len(lines) == 0 {
+		return []string{"- none"}
+	}
+	return lines
+}
+
+func moderationCapabilities(level ModerationLevel) string {
+	switch level {
+	case ModerationDelete:
+		return "delete messages"
+	case ModerationDeleteMute:
+		return "delete messages, mute members"
+	case ModerationDeleteMuteKick:
+		return "delete messages, mute members, kick members"
+	}
+	return "none"
+}
+
+func onOff(enabled bool) string {
+	if enabled {
+		return "on"
+	}
+	return "off"
+}
+
+func serializeHistoryEntry(entry HistoryEntry, mentionNames map[string]string, assistantName string, location *time.Location) (string, error) {
+	text := flattenContent(entry.Content)
+	if entry.Role != HistoryAssistant {
+		// System entries carry task text someone in the chat wrote.
+		text = prepareUntrustedChatText(text)
+	}
+	text = renderMentionView(text, entry.Mentions, mentionNames, assistantName)
+	if entry.Quote != nil {
+		entry.Quote = cloneQuote(entry.Quote)
+		entry.Quote.Text = prepareUntrustedChatText(entry.Quote.Text)
+		entry.Quote.Text = renderMentionView(entry.Quote.Text, entry.Quote.Mentions, mentionNames, assistantName)
+	}
+	switch entry.Role {
+	case HistoryUser, HistoryAssistant, HistorySystem:
+		return formatCompactHistoryEntry(entry, text, assistantName, location), nil
+	default:
+		return "", NewError(ErrorIntegrityFailure, "serialize model context", fmt.Errorf("unsupported history role"))
+	}
+}
+
+func historyDisplayNames(history []HistoryEntry) map[string]string {
+	names := make(map[string]string)
+	for _, entry := range history {
+		if entry.Sender == nil || entry.Sender.Ref.IsZero() {
+			continue
+		}
+		if name := cleanMentionName(entry.Sender.DisplayName); name != "" {
+			names[entry.Sender.Ref.String()] = name
+		}
+	}
+	return names
+}
+
+func renderMentionView(text string, bindings []MentionContext, names map[string]string, assistantName string) string {
+	if len(bindings) == 0 {
+		return text
+	}
+	replacements := make(map[string]string, len(bindings))
+	for _, binding := range bindings {
+		if binding.Bot {
+			replacements[binding.Token] = "@" + assistantName + " (Bot)"
+			continue
+		}
+		name := cleanMentionName(names[binding.SenderRef.String()])
+		if name == "" {
+			name = cleanMentionName(binding.DisplayName)
+		}
+		if name == "" {
+			name = "Unknown"
+		}
+		name = replaceReservedContextBrackets(name)
+		replacements[binding.Token] = fmt.Sprintf("@%s (%s)", name, binding.SenderRef.String())
+	}
+	return mention.Rewrite(text, replacements)
+}
+
+func cleanMentionName(name string) string {
+	name = strings.Map(func(r rune) rune {
+		if r == '@' || r == '(' || r == ')' || unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, name)
+	return strings.Join(strings.Fields(name), " ")
+}
+
+// formatCompactHistoryEntry deliberately keeps the compact transcript grammar
+// used by the model context. Durable storage still keeps structured
+// identity, quote, delivery, and timestamp fields; this is only the view sent
+// to the model. Keeping the view compact matters because it is repeated on
+// every invocation.
+//
+// Example:
+//
+//	【#000040】 12:56
+//	REPLYING TO 【#000038】 012345: "earlier text"
+//	Alice 【012345】: lanjutkan
+//
+// The bot's own messages, and quotes of them, use "<assistant name> 【Bot】".
+func formatCompactHistoryEntry(entry HistoryEntry, text, assistantName string, location *time.Location) string {
+	timestamp := entry.CreatedAt.In(location).Format("15:04")
+	if entry.Role == HistorySystem {
+		return fmt.Sprintf("【#system】 %s\nSYSTEM: %s", timestamp, text)
+	}
+
+	contextID := formatCompactContextID(entry.Sequence)
+	if entry.Role == HistoryAssistant && entry.Delivery != DeliverySucceeded {
+		// Pending/unknown assistant output is normally omitted from model
+		// context. Keep this marker for callers that render an entry directly,
+		// matching the compact transcript while delivery is unresolved.
+		contextID = "pending"
+	}
+	lines := []string{fmt.Sprintf("【#%s】 %s", contextID, timestamp)}
+	if entry.Quote != nil {
+		quotedName := entry.Quote.SenderRef.String()
+		quotedRole := groupRoleLabel(entry.Quote.SenderIsAdmin, entry.Quote.SenderIsSuperAdmin)
+		if entry.Quote.Role == HistoryAssistant {
+			quotedName = assistantName + " 【Bot】"
+			quotedRole = ""
+		} else {
+			quotedName += quotedRole
+		}
+		lines = append(lines, fmt.Sprintf("REPLYING TO 【#%s】 %s: %q", formatCompactContextID(entry.Quote.Sequence), quotedName, entry.Quote.Text))
+	}
+
+	if entry.Role == HistoryAssistant {
+		lines = append(lines, fmt.Sprintf("%s 【Bot】: %s", assistantName, text))
+		return strings.Join(lines, "\n")
+	}
+
+	displayName := "unknown"
+	senderRef := "unknown"
+	if entry.Sender != nil {
+		if trimmed := sanitizeContextDisplayName(entry.Sender.DisplayName); trimmed != "" {
+			displayName = trimmed
+		}
+		if value := entry.Sender.Ref.String(); value != "" {
+			senderRef = value
+		}
+	}
+	roleLabel := ""
+	if entry.Sender != nil {
+		roleLabel = groupRoleLabel(entry.Sender.IsAdmin, entry.Sender.IsSuperAdmin)
+	}
+	lines = append(lines, fmt.Sprintf("%s 【%s】%s: %s", displayName, senderRef, roleLabel, text))
+	return strings.Join(lines, "\n")
+}
+
+func groupRoleLabel(isAdmin, isSuperAdmin bool) string {
+	if isSuperAdmin {
+		return "【superadmin】"
+	}
+	if isAdmin {
+		return "【admin】"
+	}
+	return ""
+}
+
+// Compact context IDs are six decimal digits and wrap at 999999. The durable
+// sequence remains the source of truth for ordering and lookup; this modulo
+// only affects the display representation sent to the model.
+func formatCompactContextID(sequence uint64) string {
+	return fmt.Sprintf("%06d", sequence%compactContextIDModulus)
+}
+
+func flattenContent(parts []ContentPart) string {
+	var builder strings.Builder
+	for index, part := range parts {
+		if index > 0 {
+			builder.WriteByte('\n')
+		}
+		builder.WriteString(part.(TextPart).Text)
+	}
+	return builder.String()
+}
+
+func modelMessagesBytes(messages []ModelMessage) int {
+	total := 0
+	for _, message := range messages {
+		total += len(message.Content) + 8
+		if message.AdditionalPrompt != "" {
+			total += len(message.AdditionalPrompt) + len("<additional>\n") + len("\n</additional>")
+			if message.Content != "" {
+				total += len("\n\n")
+			}
+		}
+	}
+	return total
+}
+
+func cloneModelMessages(messages []ModelMessage) []ModelMessage {
+	return append([]ModelMessage(nil), messages...)
+}
+
+// SerializeModelMessages renders the exact role/content list built for a
+// model invocation in a human-readable form used by /dump.
+func SerializeModelMessages(messages []ModelMessage) string {
+	sections := make([]string, 0, len(messages))
+	for _, message := range messages {
+		role := "UNKNOWN"
+		switch message.Role {
+		case ModelSystem:
+			role = "SYSTEM"
+		case ModelUser:
+			role = "USER"
+		case ModelAssistant:
+			role = "ASSISTANT"
+		}
+		content := message.Content
+		if message.Provenance == ProvenanceBasePrompt && message.AdditionalPrompt != "" {
+			if content != "" {
+				content += "\n\n"
+			}
+			content += "<additional>\n" + message.AdditionalPrompt + "\n</additional>"
+		}
+		sections = append(sections, fmt.Sprintf("=== %s ===\n%s", role, content))
+	}
+	return strings.Join(sections, "\n\n")
+}
+
+// ValidateModelMessages enforces that only known typed provenance can occupy a
+// model role. Adapters call it before translating to provider-specific DTOs.
+func ValidateModelMessages(messages []ModelMessage) error {
+	if len(messages) == 0 {
+		return NewError(ErrorInvalidArgument, "validate model messages", fmt.Errorf("model messages are required"))
+	}
+	currentCount := 0
+	basePromptCount := 0
+	overrideCount := 0
+	chatInformationCount := 0
+	chatStateCount := 0
+	subagentCount := 0
+	historyTranscriptCount := 0
+	promptPhase := true
+	for _, message := range messages {
+		if message.Provenance == ProvenanceBasePrompt && message.Content != "" {
+			return NewError(ErrorInvalidArgument, "validate model messages", fmt.Errorf("base prompt text belongs in the additional prompt"))
+		}
+		if message.Provenance != ProvenanceBasePrompt && message.AdditionalPrompt != "" {
+			return NewError(ErrorInvalidArgument, "validate model messages", fmt.Errorf("additional prompt must be on the base prompt message"))
+		}
+		if message.AdditionalPrompt != "" && !utf8.ValidString(message.AdditionalPrompt) {
+			return NewError(ErrorInvalidArgument, "validate model messages", fmt.Errorf("additional prompt is invalid"))
+		}
+		// The base prompt message only carries the <additional> text, which is
+		// empty when a replace-mode override drops the configured chat prompt.
+		if message.Provenance != ProvenanceBasePrompt && strings.TrimSpace(message.Content) == "" {
+			return NewError(ErrorInvalidArgument, "validate model messages", fmt.Errorf("model message content is required"))
+		}
+		valid := false
+		switch message.Provenance {
+		case ProvenanceBasePrompt:
+			basePromptCount++
+			valid = promptPhase && overrideCount == 0 && message.Role == ModelSystem
+		case ProvenancePromptOverride:
+			overrideCount++
+			// The /prompt override (or the default "none" text) is a user
+			// message; the configured chat prompt is in the system <additional> block.
+			valid = promptPhase && message.Role == ModelUser &&
+				strings.HasPrefix(message.Content, "<prompt_override>\n") &&
+				strings.HasSuffix(message.Content, "\n</prompt_override>")
+			promptPhase = false
+		case ProvenanceChatInformation:
+			chatInformationCount++
+			valid = message.Role == ModelUser && historyTranscriptCount == 0 && currentCount == 0
+			promptPhase = false
+		case ProvenanceChatState:
+			chatStateCount++
+			valid = message.Role == ModelUser && historyTranscriptCount == 0 && currentCount == 0 &&
+				strings.HasPrefix(message.Content, "<chat_state>\n") && strings.HasSuffix(message.Content, "\n</chat_state>")
+			promptPhase = false
+		case ProvenanceSubagent:
+			subagentCount++
+			valid = message.Role == ModelUser && historyTranscriptCount == 0 && currentCount == 0 &&
+				strings.HasPrefix(message.Content, "<subagent>\n")
+			promptPhase = false
+		case ProvenanceHistorySystem:
+			promptPhase = false
+			valid = message.Role == ModelSystem
+		case ProvenanceHistoryUser:
+			promptPhase = false
+			valid = message.Role == ModelUser
+		case ProvenanceCurrentUser:
+			promptPhase = false
+			currentCount++
+			valid = message.Role == ModelUser
+		case ProvenanceHistoryAssistant:
+			promptPhase = false
+			valid = message.Role == ModelAssistant
+		case ProvenanceHistoryTranscript:
+			promptPhase = false
+			historyTranscriptCount++
+			valid = message.Role == ModelUser &&
+				strings.HasPrefix(message.Content, "<untrusted_chat_history>\n") &&
+				strings.HasSuffix(message.Content, "\n</untrusted_chat_history>")
+		}
+		if !valid {
+			return NewError(ErrorInvalidArgument, "validate model messages", fmt.Errorf("model role and provenance do not match"))
+		}
+	}
+	last := messages[len(messages)-1].Provenance
+	if historyTranscriptCount > 0 {
+		if historyTranscriptCount != 1 || currentCount != 0 || last != ProvenanceHistoryTranscript {
+			return NewError(ErrorInvalidArgument, "validate model messages", fmt.Errorf("history transcript must be one final user block"))
+		}
+	} else if currentCount != 1 || last != ProvenanceCurrentUser {
+		return NewError(ErrorInvalidArgument, "validate model messages", fmt.Errorf("current user message must be last"))
+	}
+	if basePromptCount > 1 || overrideCount > 1 || chatInformationCount > 1 || chatStateCount > 1 || subagentCount > 1 {
+		return NewError(ErrorInvalidArgument, "validate model messages", fmt.Errorf("model prompts must not be duplicated"))
+	}
+	return nil
+}

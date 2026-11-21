@@ -1,0 +1,56 @@
+version: '3'
+
+includes:
+  common: ./build/Taskfile.yml
+  windows: ./build/windows/Taskfile.yml
+  linux: ./build/linux/Taskfile.yml
+  darwin: ./build/darwin/Taskfile.yml
+  android: ./build/android/Taskfile.yml
+
+vars:
+  APP_NAME: WazzapAgent
+  BIN_DIR: bin
+  NPM: '{{.NPM | default "npm"}}'
+  VITE_PORT: '{{.WAILS_VITE_PORT | default 9245}}'
+
+tasks:
+  build:
+    summary: Build the GUI for the current desktop host
+    cmds:
+      - task: '{{OS}}:build'
+
+  package:
+    summary: Build the production GUI for the current desktop host
+    cmds:
+      - task: '{{OS}}:package'
+
+  run:
+    summary: Run the already built GUI for the current desktop host
+    cmds:
+      - task: '{{OS}}:run'
+
+  dev:
+    summary: Run Wails development mode
+    cmds:
+      - wails3 dev -config ./build/config.yml -port {{.VITE_PORT}}
+
+  web:build:
+    summary: Build the shared UI and headless browser server
+    cmds:
+      - task: common:install:frontend:deps
+      - cmd: '{{.NPM}} run build:web'
+        dir: frontend
+      - go build -tags web -o {{.BIN_DIR}}/WazzapAgent-web{{if eq OS "windows"}}.exe{{end}} ./cmd/server
+
+  webhost:build:
+    summary: Build the token-protected web host (wazzapagent-web) for Linux servers
+    cmds:
+      - task: common:install:frontend:deps
+      - cmd: '{{.NPM}} run build:web'
+        dir: frontend
+      - go build -tags web -trimpath -ldflags '-s -w' -o {{.BIN_DIR}}/wazzapagent-web{{if eq OS "windows"}}.exe{{end}} ./cmd/webhost
+
+  web:run:
+    summary: Run the browser server on a loopback address
+    cmds:
+      - '{{.BIN_DIR}}/WazzapAgent-web{{if eq OS "windows"}}.exe{{end}}'

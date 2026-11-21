@@ -1,0 +1,1246 @@
+package inbound_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/action"
+	appsqlite "github.com/Chomosuke9/WazzapAgent-Go/internal/adapters/sqlite"
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/agent"
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/command"
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/conversation"
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/identity"
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/inbound"
+	"github.com/Chomosuke9/WazzapAgent-Go/internal/policy"
+)
+
+func TestFakeEndToEndEligibleDMIsSentExactlyOnce(t *testing.T) {
+	fixture := newFixture(t)
+	candidate := fixture.candidate("dm-1", "15550000002@s.whatsapp.net", conversation.ChatDirect, "hello")
+	if err := fixture.handler.Handle(context.Background(), candidate); err != nil {
+		t.Fatalf("handle DM: %v", err)
+	}
+	if err := fixture.handler.Handle(context.Background(), candidate); err != nil {
+		t.Fatalf("handle duplicate DM: %v", err)
+	}
+	if fixture.model.calls.Load() != 1 || fixture.sender.count() != 1 {
+		t.Fatalf("model/sender calls = %d/%d, want 1/1", fixture.model.calls.Load(), fixture.sender.count())
+	}
+	if fixture.sender.last().Text != "reply: hello" {
+		t.Fatalf("sent text = %q", fixture.sender.last().Text)
+	}
+	claimed, err := fixture.store.Inbound().ClaimAndResolveSender(context.Background(), candidate)
+	if err != nil {
+		t.Fatalf("load durable message: %v", err)
+	}
+	if err := fixture.handler.Resume(context.Background(), claimed.Message); err != nil {
+		t.Fatalf("explicit plan replay: %v", err)
+	}
+	if fixture.model.calls.Load() != 1 || fixture.sender.count() != 1 {
+		t.Fatalf("explicit replay model/sender calls = %d/%d, want 1/1", fixture.model.calls.Load(), fixture.sender.count())
+	}
+}
+
+func TestFakeEndToEndGroupRequiresMention(t *testing.T) {
+	fixture := newFixture(t)
+	chat := "120363000000000001@g.us"
+	ignored := fixture.candidate("group-1", chat, conversation.ChatGroup, "without mention")
+	if err := fixture.handler.Handle(context.Background(), ignored); err != nil {
+		t.Fatalf("handle non-mention: %v", err)
+	}
+	if fixture.model.calls.Load() != 0 || fixture.sender.count() != 0 {
+		t.Fatal("non-mentioned group message reached model or sender")
+	}
+	mentioned := fixture.candidate("group-2", chat, conversation.ChatGroup, "with mention")
+	mentioned.MentionsBot = true
+	if err := fixture.handler.Handle(context.Background(), mentioned); err != nil {
+		t.Fatalf("handle mention: %v", err)
+	}
+	if fixture.model.calls.Load() != 1 || fixture.sender.count() != 1 {
+		t.Fatalf("mentioned group model/sender calls = %d/%d", fixture.model.calls.Load(), fixture.sender.count())
+	}
+}
+
+func TestTriggerCommandConfiguresCustomRegexForGroupInvocation(t *testing.T) {
+	fixture := newFixture(t)
+	chat := "120363000000000015@g.us"
+	dmFixture := newFixture(t)
+	ownerDM := dmFixture.candidate("trigger-owner-dm", "155500000015@s.whatsapp.net", conversation.ChatDirect, "/trigger mention off")
+	ownerDM.Owner = true
+	if err := dmFixture.handler.Handle(context.Background(), ownerDM); err != nil {
+		t.Fatalf("handle owner trigger command in DM: %v", err)
+	}
+	if dmFixture.sender.count() != 1 {
+		t.Fatalf("owner trigger DM response count = %d", dmFixture.sender.count())
+	}
+	if reply := dmFixture.sender.last().Text; !strings.Contains(reply, "in a group") {
+		t.Fatalf("owner trigger DM response = %q", reply)
+	}
+
+	denialFixture := newFixture(t)
+	denied := denialFixture.candidate("trigger-denied", chat, conversation.ChatGroup, "/trigger mention off")
+	if err := denialFixture.handler.Handle(context.Background(), denied); err != nil {
+		t.Fatalf("handle non-owner trigger command: %v", err)
+	}
+	if !strings.Contains(denialFixture.sender.last().Text, "can only be used by the owner") {
+		t.Fatalf("trigger command denial = %q", denialFixture.sender.last().Text)
+	}
+	configure := fixture.candidate("trigger-configure", chat, conversation.ChatGroup, `/trigger pattern (?i)\bvivy\b.*help`)
+	configure.Owner = true
+	if err := fixture.handler.Handle(context.Background(), configure); err != nil {
+		t.Fatalf("configure name regex: %v", err)
+	}
+	claimed, err := fixture.store.Inbound().ClaimAndResolveSender(context.Background(), configure)
+	if err != nil {
+		t.Fatalf("claim trigger command: %v", err)
+	}
+	key := agent.Key{TenantID: claimed.Message.TenantID, AccountID: claimed.Message.AccountID, ChatID: claimed.Message.ChatID}
+	snapshot, err := fixture.store.Configs().Load(context.Background(), key)
+	if err != nil || !snapshot.Triggers.Name || !snapshot.Triggers.NameRegex || snapshot.Triggers.NamePattern != `(?i)\bvivy\b.*help` {
+		t.Fatalf("stored trigger settings = %#v, err=%v", snapshot.Triggers, err)
+	}
+
+	message := fixture.candidate("trigger-regex-match", chat, conversation.ChatGroup, "VIVY could you help with this?")
+	if err := fixture.handler.Handle(context.Background(), message); err != nil {
+		t.Fatalf("handle regex-triggered group message: %v", err)
+	}
+	if fixture.model.calls.Load() != 1 || fixture.sender.count() != 2 {
+		t.Fatalf("regex trigger model/sender calls = %d/%d, want 1/2", fixture.model.calls.Load(), fixture.sender.count())
+	}
+}
+
+func TestRegisteredCommandDoesNotRequireGroupMention(t *testing.T) {
+	fixture := newFixture(t)
+	command := fixture.candidate("group-command", "120363000000000001@g.us", conversation.ChatGroup, "/help")
+	if err := fixture.handler.Handle(context.Background(), command); err != nil {
+		t.Fatalf("handle group command: %v", err)
+	}
+	if fixture.model.calls.Load() != 0 {
+		t.Fatalf("group command invoked model %d times", fixture.model.calls.Load())
+	}
+	if fixture.sender.count() != 1 || !strings.Contains(fixture.sender.last().Text, "/help") {
+		t.Fatalf("group command response count/text = %d/%q", fixture.sender.count(), fixture.sender.last().Text)
+	}
+}
+
+func TestBotOriginatedPublicCommandUsesTheSameCommandLane(t *testing.T) {
+	fixture := newFixture(t)
+	command := fixture.candidate("bot-prompt", "15550000002@s.whatsapp.net", conversation.ChatDirect, "/prompt")
+	command.FromMe = true
+	if err := fixture.handler.Handle(context.Background(), command); err != nil {
+		t.Fatalf("handle bot command: %v", err)
+	}
+	if fixture.model.calls.Load() != 0 {
+		t.Fatalf("bot command invoked model %d times", fixture.model.calls.Load())
+	}
+	if fixture.sender.count() != 1 || !strings.Contains(fixture.sender.last().Text, "Custom instructions") {
+		t.Fatalf("bot command response count/text = %d/%q", fixture.sender.count(), fixture.sender.last().Text)
+	}
+}
+
+func TestBotOriginatedOwnerCommandIsBlockedByFromMePermission(t *testing.T) {
+	fixture := newFixture(t)
+	command := fixture.candidate("bot-dump", "15550000002@s.whatsapp.net", conversation.ChatDirect, "/dump")
+	command.FromMe = true
+	command.Owner = true
+	if err := fixture.handler.Handle(context.Background(), command); err != nil {
+		t.Fatalf("handle bot owner command: %v", err)
+	}
+	if fixture.sender.count() != 1 || !strings.Contains(fixture.sender.last().Text, "can only be used by the configured owner") {
+		t.Fatalf("bot owner denial count/text = %d/%q", fixture.sender.count(), fixture.sender.last().Text)
+	}
+	if fixture.model.calls.Load() != 0 {
+		t.Fatalf("blocked bot command invoked model %d times", fixture.model.calls.Load())
+	}
+}
+
+func TestOwnerDumpReturnsTheAgentBuiltInputWithoutInvokingModel(t *testing.T) {
+	fixture := newFixture(t)
+	dump := fixture.candidate("dump-1", "15550000002@s.whatsapp.net", conversation.ChatDirect, "/dump")
+	dump.Owner = true
+	if err := fixture.handler.Handle(context.Background(), dump); err != nil {
+		t.Fatalf("handle dump: %v", err)
+	}
+	output := fixture.sender.last().Text
+	if !strings.Contains(output, "=== SYSTEM ===\n<additional>\nbase prompt\n</additional>") ||
+		!strings.Contains(output, "=== USER ===\n") ||
+		strings.Count(output, "=== USER ===") != 4 || !strings.Contains(output, "<chat_state>") ||
+		!strings.Contains(output, "<prompt_override>\nNo prompt override is provided here. Follow your default behavior.\n</prompt_override>") ||
+		!strings.Contains(output, "<untrusted_chat_history>") ||
+		strings.Contains(output, "=== ASSISTANT ===") ||
+		!strings.Contains(output, "/dump") || !strings.Contains(output, "【#000") {
+		t.Fatalf("dump output = %q", output)
+	}
+	if fixture.model.calls.Load() != 0 {
+		t.Fatalf("dump invoked model %d times", fixture.model.calls.Load())
+	}
+}
+
+func TestFullGroupTranscriptIncludesPassiveMessagesInNextInvocation(t *testing.T) {
+	fixture := newFixture(t)
+	chat := "120363000000000002@g.us"
+	passive := fixture.candidate("group-passive", chat, conversation.ChatGroup, "context before mention")
+	if err := fixture.handler.Handle(context.Background(), passive); err != nil {
+		t.Fatalf("handle passive group message: %v", err)
+	}
+	trigger := fixture.candidate("group-trigger", chat, conversation.ChatGroup, "please answer this")
+	trigger.MentionsBot = true
+	if err := fixture.handler.Handle(context.Background(), trigger); err != nil {
+		t.Fatalf("handle group trigger: %v", err)
+	}
+	request := fixture.model.lastRequest()
+	seenPassive := false
+	seenTrigger := false
+	for _, message := range request.Messages {
+		seenPassive = seenPassive || strings.Contains(message.Content, "context before mention")
+		seenTrigger = seenTrigger || strings.Contains(message.Content, "please answer this")
+	}
+	if !seenPassive || !seenTrigger {
+		t.Fatalf("full group context = %#v", request.Messages)
+	}
+	claimed, err := fixture.store.Inbound().ClaimAndResolveSender(context.Background(), passive)
+	if err != nil {
+		t.Fatalf("reload passive message: %v", err)
+	}
+	current, err := fixture.registry.AgentFor(context.Background(), agent.Key{
+		TenantID: claimed.Message.TenantID, AccountID: claimed.Message.AccountID, ChatID: claimed.Message.ChatID,
+	})
+	if err != nil {
+		t.Fatalf("load group agent: %v", err)
+	}
+	snapshot, err := current.Config().Refresh(context.Background())
+	if err != nil {
+		t.Fatalf("load group config: %v", err)
+	}
+	page, err := current.History().List(context.Background(), snapshot.Version, agent.HistoryQuery{Limit: 10})
+	if err != nil || len(page.Entries) != 3 {
+		t.Fatalf("full group history = %#v, err=%v", page, err)
+	}
+	for index, entry := range page.Entries {
+		if entry.Sequence == 0 || (index > 0 && entry.Sequence <= page.Entries[index-1].Sequence) {
+			t.Fatalf("history sequence is not strictly increasing: %#v", page.Entries)
+		}
+	}
+}
+
+func TestRapidMessagesAreDurablyDebouncedIntoOneBoundedBatch(t *testing.T) {
+	// The window must outlast the second Handle's store writes, which can
+	// take tens of milliseconds under the race detector on a slow runner.
+	fixture := newFixtureWithBatching(t, 500*time.Millisecond, 8)
+	chat := "15550000012@s.whatsapp.net"
+	first := fixture.candidate("batch-1", chat, conversation.ChatDirect, "first")
+	second := fixture.candidate("batch-2", chat, conversation.ChatDirect, "second")
+	second.OccurredAt = first.OccurredAt.Add(time.Millisecond)
+	second.ReceivedAt = first.ReceivedAt.Add(time.Millisecond)
+	var wait sync.WaitGroup
+	errors := make(chan error, 2)
+	wait.Add(2)
+	go func() {
+		defer wait.Done()
+		errors <- fixture.handler.Handle(context.Background(), first)
+	}()
+	time.Sleep(5 * time.Millisecond)
+	go func() {
+		defer wait.Done()
+		errors <- fixture.handler.Handle(context.Background(), second)
+	}()
+	wait.Wait()
+	close(errors)
+	for err := range errors {
+		if err != nil {
+			t.Fatalf("handle batch: %v", err)
+		}
+	}
+	if fixture.model.calls.Load() != 1 || fixture.sender.count() != 1 {
+		t.Fatalf("batched model/sender calls = %d/%d, want 1/1", fixture.model.calls.Load(), fixture.sender.count())
+	}
+	if err := fixture.handler.Handle(context.Background(), first); err != nil {
+		t.Fatalf("replay non-anchor batch member: %v", err)
+	}
+	if fixture.model.calls.Load() != 1 || fixture.sender.count() != 1 {
+		t.Fatal("replayed non-anchor batch member produced another effect")
+	}
+	claimed, err := fixture.store.Inbound().ClaimAndResolveSender(context.Background(), second)
+	if err != nil {
+		t.Fatalf("reload batch anchor: %v", err)
+	}
+	key := agent.Key{TenantID: claimed.Message.TenantID, AccountID: claimed.Message.AccountID, ChatID: claimed.Message.ChatID}
+	current, err := fixture.registry.AgentFor(context.Background(), key)
+	if err != nil {
+		t.Fatalf("load batch agent: %v", err)
+	}
+	snapshot, _ := current.Config().Refresh(context.Background())
+	page, err := current.History().List(context.Background(), snapshot.Version, agent.HistoryQuery{Limit: 10})
+	if err != nil {
+		t.Fatalf("list batch history: %v", err)
+	}
+	if len(page.Entries) != 3 || page.Entries[0].Role != agent.HistoryUser ||
+		page.Entries[1].Role != agent.HistoryUser || page.Entries[2].Role != agent.HistoryAssistant {
+		t.Fatalf("batched history = %#v", page.Entries)
+	}
+}
+
+func TestMessageBurstCapSplitsOversizedBurstWithoutLosingRemainder(t *testing.T) {
+	fixture := newFixtureWithBatching(t, 30*time.Millisecond, 2)
+	chat := "15550000014@s.whatsapp.net"
+	var wait sync.WaitGroup
+	errors := make(chan error, 3)
+	for index := 0; index < 3; index++ {
+		candidate := fixture.candidate(fmt.Sprintf("burst-%d", index), chat, conversation.ChatDirect, fmt.Sprintf("message-%d", index))
+		candidate.OccurredAt = candidate.OccurredAt.Add(time.Duration(index) * time.Millisecond)
+		candidate.ReceivedAt = candidate.ReceivedAt.Add(time.Duration(index) * time.Millisecond)
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			errors <- fixture.handler.Handle(context.Background(), candidate)
+		}()
+		time.Sleep(2 * time.Millisecond)
+	}
+	wait.Wait()
+	close(errors)
+	for err := range errors {
+		if err != nil {
+			t.Fatalf("handle bounded burst: %v", err)
+		}
+	}
+	if fixture.model.calls.Load() != 2 || fixture.sender.count() != 2 {
+		t.Fatalf("bounded burst model/sender calls = %d/%d, want 2/2", fixture.model.calls.Load(), fixture.sender.count())
+	}
+}
+
+func TestMessagesBeyondTheMemoryBoundAreReadBackFromTheInbox(t *testing.T) {
+	defer inbound.SetMaxPending(2)()
+	fixture := newFixtureWithBatching(t, 30*time.Millisecond, 2)
+	chat := "15550000015@s.whatsapp.net"
+	var wait sync.WaitGroup
+	errors := make(chan error, 6)
+	for index := 0; index < 6; index++ {
+		candidate := fixture.candidate(fmt.Sprintf("overflow-%d", index), chat, conversation.ChatDirect, fmt.Sprintf("message-%d", index))
+		candidate.OccurredAt = candidate.OccurredAt.Add(time.Duration(index) * time.Millisecond)
+		candidate.ReceivedAt = candidate.ReceivedAt.Add(time.Duration(index) * time.Millisecond)
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			errors <- fixture.handler.Handle(context.Background(), candidate)
+		}()
+	}
+	wait.Wait()
+	close(errors)
+	for err := range errors {
+		if err != nil {
+			t.Fatalf("handle overflowing burst: %v", err)
+		}
+	}
+	unfinished, err := fixture.store.Inbound().ListUnfinished(context.Background(), fixture.tenantID, nil, 0)
+	if err != nil || len(unfinished) != 0 {
+		t.Fatalf("messages left unanswered after overflow: %d, err=%v", len(unfinished), err)
+	}
+	if fixture.model.calls.Load() < 3 {
+		t.Fatalf("model calls = %d, want at least 3 batches of at most 2", fixture.model.calls.Load())
+	}
+}
+
+type flakyClaimStore struct {
+	inbound.Store
+	failures atomic.Int32
+}
+
+func (store *flakyClaimStore) ClaimBatch(ctx context.Context, batch []conversation.IncomingMessage) ([]conversation.IncomingMessage, []conversation.IncomingMessage, error) {
+	if store.failures.Add(-1) >= 0 {
+		return nil, nil, agent.NewError(agent.ErrorUnavailable, "claim batch", errors.New("database is busy"))
+	}
+	return store.Store.ClaimBatch(ctx, batch)
+}
+
+type flakyInboxStore struct {
+	inbound.Store
+	failures atomic.Int32
+}
+
+func (store *flakyInboxStore) ListUnfinishedInChat(ctx context.Context, key agent.Key, limit int) ([]conversation.IncomingMessage, error) {
+	if store.failures.Add(-1) >= 0 {
+		return nil, agent.NewError(agent.ErrorUnavailable, "list unfinished", errors.New("database is busy"))
+	}
+	return store.Store.ListUnfinishedInChat(ctx, key, limit)
+}
+
+func TestAFailedInboxReadBackIsTriedAgain(t *testing.T) {
+	defer inbound.SetMaxPending(2)()
+	fixture := newFixture(t)
+	store := &flakyInboxStore{Store: fixture.store.Inbound()}
+	store.failures.Store(1)
+	dispatcher, err := inbound.NewDispatcher(
+		store, fixture.registry, fixture.gate, fixture.responder, inbound.DiscardObserver{},
+		command.Platform{Text: fixture.sender}, inbound.Options{Debounce: 200 * time.Millisecond, BurstCap: 256, Report: fixture.handler.report},
+	)
+	if err != nil {
+		t.Fatalf("create inbound dispatcher: %v", err)
+	}
+	fixture.handler.dispatcher = dispatcher
+	// Two messages fit in memory; the other two wait in the inbox, and the
+	// first read-back fails.
+	chat := "15550000017@s.whatsapp.net"
+	for index := 0; index < 4; index++ {
+		candidate := fixture.candidate(fmt.Sprintf("flaky-inbox-%d", index), chat, conversation.ChatDirect, fmt.Sprintf("message-%d", index))
+		if err := dispatcher.Handle(context.Background(), candidate); err != nil {
+			t.Fatalf("handle: %v", err)
+		}
+	}
+	if err := fixture.handler.settle(nil); err != nil {
+		t.Fatalf("settle overflowing burst: %v", err)
+	}
+	unfinished, err := fixture.store.Inbound().ListUnfinished(context.Background(), fixture.tenantID, nil, 0)
+	if err != nil || len(unfinished) != 0 {
+		t.Fatalf("messages left unanswered after a failed read-back: %d, err=%v", len(unfinished), err)
+	}
+}
+
+func TestRecoveryReadsTheInboxPageByPage(t *testing.T) {
+	defer inbound.SetMaxPending(2)()
+	fixture := newFixture(t)
+	for index := 0; index < 5; index++ {
+		chat := fmt.Sprintf("1555000002%d@s.whatsapp.net", index)
+		candidate := fixture.candidate(fmt.Sprintf("paged-%d", index), chat, conversation.ChatDirect, "hello")
+		if _, err := fixture.store.Inbound().ClaimAndResolveSender(context.Background(), candidate); err != nil {
+			t.Fatalf("store unfinished message: %v", err)
+		}
+	}
+	if err := fixture.handler.Recover(context.Background(), fixture.tenantID); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	unfinished, err := fixture.store.Inbound().ListUnfinished(context.Background(), fixture.tenantID, nil, 0)
+	if err != nil || len(unfinished) != 0 || fixture.sender.count() != 5 {
+		t.Fatalf("after paged recovery: unfinished=%d replies=%d err=%v, want 0/5", len(unfinished), fixture.sender.count(), err)
+	}
+}
+
+func TestAFailedClaimIsTriedAgain(t *testing.T) {
+	fixture := newFixture(t)
+	store := &flakyClaimStore{Store: fixture.store.Inbound()}
+	store.failures.Store(1)
+	dispatcher, err := inbound.NewDispatcher(
+		store, fixture.registry, fixture.gate, fixture.responder, inbound.DiscardObserver{},
+		command.Platform{Text: fixture.sender}, inbound.Options{BurstCap: 1, Report: fixture.handler.report},
+	)
+	if err != nil {
+		t.Fatalf("create inbound dispatcher: %v", err)
+	}
+	fixture.handler.dispatcher = dispatcher
+	candidate := fixture.candidate("flaky-claim", "15550000016@s.whatsapp.net", conversation.ChatDirect, "hello")
+	if err := fixture.handler.Handle(context.Background(), candidate); err != nil {
+		t.Fatalf("handle after a failed claim: %v", err)
+	}
+	if fixture.model.calls.Load() != 1 || fixture.sender.count() != 1 {
+		t.Fatalf("model calls=%d replies=%d, want 1/1", fixture.model.calls.Load(), fixture.sender.count())
+	}
+}
+
+func TestGroupReplyToBotTriggersAndCarriesCanonicalQuote(t *testing.T) {
+	fixture := newFixture(t)
+	chat := "120363000000000012@g.us"
+	first := fixture.candidate("quote-source", chat, conversation.ChatGroup, "first")
+	first.MentionsBot = true
+	if err := fixture.handler.Handle(context.Background(), first); err != nil {
+		t.Fatalf("handle quoted source: %v", err)
+	}
+	receipt := "provider-" + fixture.sender.last().ActionID.String()
+	reply := fixture.candidate("quote-reply", chat, conversation.ChatGroup, "reply without mention")
+	reply.ProviderQuotedMessageID = receipt
+	if err := fixture.handler.Handle(context.Background(), reply); err != nil {
+		t.Fatalf("handle reply to bot: %v", err)
+	}
+	if fixture.model.calls.Load() != 2 || fixture.sender.count() != 2 {
+		t.Fatalf("reply trigger calls = %d/%d", fixture.model.calls.Load(), fixture.sender.count())
+	}
+	claimed, err := fixture.store.Inbound().ClaimAndResolveSender(context.Background(), reply)
+	if err != nil {
+		t.Fatalf("reload reply: %v", err)
+	}
+	if !claimed.Message.RepliedToBot || claimed.Message.Quote == nil ||
+		claimed.Message.Quote.Role != conversation.QuoteAssistant || claimed.Message.Quote.ID.IsZero() ||
+		claimed.Message.Quote.Sequence == 0 {
+		t.Fatalf("canonical reply quote = %#v", claimed.Message)
+	}
+}
+
+func TestHistoryContextSurvivesStoreAndAgentRecreation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "restart-history.db")
+	tenantID, _ := identity.NewTenantID()
+	accountID, _ := identity.NewAccountID()
+	firstRuntime := newFixtureAtPath(t, path, tenantID, accountID, 0, 1)
+	chat := "15550000016@s.whatsapp.net"
+	first := firstRuntime.candidate("restart-context-1", chat, conversation.ChatDirect, "remember blue")
+	if err := firstRuntime.handler.Handle(context.Background(), first); err != nil {
+		t.Fatalf("handle first message: %v", err)
+	}
+	if err := firstRuntime.store.Close(); err != nil {
+		t.Fatalf("close first store: %v", err)
+	}
+
+	secondRuntime := newFixtureAtPath(t, path, tenantID, accountID, 0, 1)
+	followup := secondRuntime.candidate("restart-context-2", chat, conversation.ChatDirect, "what color?")
+	if err := secondRuntime.handler.Handle(context.Background(), followup); err != nil {
+		t.Fatalf("handle follow-up after restart: %v", err)
+	}
+	request := secondRuntime.model.lastRequest()
+	if len(request.Messages) != 5 ||
+		!strings.Contains(request.Messages[4].Content, "remember blue") ||
+		!strings.Contains(request.Messages[4].Content, "reply: remember blue") ||
+		!strings.Contains(request.Messages[4].Content, "what color?") ||
+		!strings.HasPrefix(request.Messages[4].Content, "<untrusted_chat_history>\n") ||
+		!strings.HasSuffix(request.Messages[4].Content, "\n</untrusted_chat_history>") {
+		t.Fatalf("recreated model context = %#v", request.Messages)
+	}
+}
+
+func TestHelpInfoAndOwnerOnlyReset(t *testing.T) {
+	fixture := newFixture(t)
+	chat := "15550000013@s.whatsapp.net"
+	if err := fixture.handler.Handle(context.Background(), fixture.candidate("control-history", chat, conversation.ChatDirect, "remember")); err != nil {
+		t.Fatalf("seed history: %v", err)
+	}
+	help := fixture.candidate("control-help", chat, conversation.ChatDirect, "/help")
+	if err := fixture.handler.Handle(context.Background(), help); err != nil {
+		t.Fatalf("help: %v", err)
+	}
+	if !strings.Contains(fixture.sender.last().Text, "/reset") {
+		t.Fatalf("help response = %q", fixture.sender.last().Text)
+	}
+	info := fixture.candidate("control-info", chat, conversation.ChatDirect, "/info")
+	if err := fixture.handler.Handle(context.Background(), info); err != nil {
+		t.Fatalf("info: %v", err)
+	}
+	if !strings.Contains(fixture.sender.last().Text, "History: active") {
+		t.Fatalf("info response = %q", fixture.sender.last().Text)
+	}
+	malformedInfo := fixture.candidate("control-info-malformed", chat, conversation.ChatDirect, "/info unexpected")
+	if err := fixture.handler.Handle(context.Background(), malformedInfo); err != nil {
+		t.Fatalf("malformed info: %v", err)
+	}
+	if got := fixture.sender.last().Text; got != "The /info command does not accept arguments." {
+		t.Fatalf("malformed info response = %q", got)
+	}
+	denied := fixture.candidate("control-reset-denied", chat, conversation.ChatDirect, "/reset")
+	if err := fixture.handler.Handle(context.Background(), denied); err != nil {
+		t.Fatalf("denied reset: %v", err)
+	}
+	if !strings.Contains(fixture.sender.last().Text, "can only be used by group admins or the owner") {
+		t.Fatalf("reset denial = %q", fixture.sender.last().Text)
+	}
+	reset := fixture.candidate("control-reset", chat, conversation.ChatDirect, "/reset")
+	reset.Owner = true
+	if err := fixture.handler.Handle(context.Background(), reset); err != nil {
+		t.Fatalf("owner reset: %v", err)
+	}
+	claimed, _ := fixture.store.Inbound().ClaimAndResolveSender(context.Background(), reset)
+	key := agent.Key{TenantID: claimed.Message.TenantID, AccountID: claimed.Message.AccountID, ChatID: claimed.Message.ChatID}
+	current, _ := fixture.registry.AgentFor(context.Background(), key)
+	snapshot, _ := current.Config().Refresh(context.Background())
+	page, err := current.History().List(context.Background(), snapshot.Version, agent.HistoryQuery{Limit: 10})
+	if err != nil || len(page.Entries) != 0 {
+		t.Fatalf("history after owner reset = %#v, err=%v", page, err)
+	}
+}
+
+func TestKnownMalformedCommandDoesNotFallThroughToModel(t *testing.T) {
+	fixture := newFixture(t)
+	candidate := fixture.candidate("control-malformed", "15550000017@s.whatsapp.net", conversation.ChatDirect, "/help unexpected")
+	if err := fixture.handler.Handle(context.Background(), candidate); err != nil {
+		t.Fatalf("handle malformed command: %v", err)
+	}
+	if fixture.model.calls.Load() != 0 {
+		t.Fatalf("malformed command invoked model %d times", fixture.model.calls.Load())
+	}
+	if got := fixture.sender.last().Text; got != "The /help command does not accept arguments." {
+		t.Fatalf("malformed command response = %q", got)
+	}
+}
+
+func TestCommandAuthorizationRereadsDurableLIDBoundOwner(t *testing.T) {
+	fixture := newFixture(t)
+	candidate := fixture.candidate("current-owner-only", "15550000018@s.whatsapp.net", conversation.ChatDirect, "/reset")
+	claimed, err := fixture.store.Inbound().ClaimAndResolveSender(context.Background(), candidate)
+	if err != nil {
+		t.Fatalf("claim command: %v", err)
+	}
+	// The message snapshot is deliberately forged after the durable identity
+	// boundary. Authorization must consult the participant's current LID-bound
+	// policy record instead of this transient field.
+	claimed.Message.Owner = true
+	if err := fixture.handler.Resume(context.Background(), claimed.Message); err != nil {
+		t.Fatalf("resume command: %v", err)
+	}
+	if got := fixture.sender.last().Text; got != "The /reset command can only be used by group admins or the owner." {
+		t.Fatalf("forged owner command response = %q", got)
+	}
+}
+
+func TestPromptCommandsAreOwnerOnlyPersistedAndBypassModel(t *testing.T) {
+	fixture := newFixture(t)
+	chat := "15550000003@s.whatsapp.net"
+	set := fixture.candidate("prompt-1", chat, conversation.ChatDirect, "/prompt set speak concisely")
+	set.Owner = true
+	if err := fixture.handler.Handle(context.Background(), set); err != nil {
+		t.Fatalf("set prompt: %v", err)
+	}
+	if fixture.model.calls.Load() != 0 || fixture.sender.count() != 1 {
+		t.Fatalf("prompt set model/sender calls = %d/%d", fixture.model.calls.Load(), fixture.sender.count())
+	}
+	claimed, err := fixture.store.Inbound().ClaimAndResolveSender(context.Background(), set)
+	if err != nil {
+		t.Fatalf("reload prompt message: %v", err)
+	}
+	key := agent.Key{TenantID: claimed.Message.TenantID, AccountID: claimed.Message.AccountID, ChatID: claimed.Message.ChatID}
+	snapshot, err := fixture.store.Configs().Load(context.Background(), key)
+	if err != nil {
+		t.Fatalf("load prompt config: %v", err)
+	}
+	if snapshot.Version != 2 || snapshot.PromptOverride == nil || snapshot.PromptOverride.Text != "speak concisely" || snapshot.Prompt != "base prompt" {
+		t.Fatalf("persisted prompt config = %#v", snapshot)
+	}
+
+	view := fixture.candidate("prompt-2", chat, conversation.ChatDirect, "/prompt view")
+	view.Owner = true
+	if err := fixture.handler.Handle(context.Background(), view); err != nil {
+		t.Fatalf("view prompt: %v", err)
+	}
+	if got := fixture.sender.last().Text; !strings.HasPrefix(got, "*Custom instructions*, added to the main prompt:\nspeak concisely\n") {
+		t.Fatalf("view response = %q", got)
+	}
+
+	denied := fixture.candidate("prompt-3", chat, conversation.ChatDirect, "/prompt set unauthorized")
+	denied.Owner = false
+	if err := fixture.handler.Handle(context.Background(), denied); err != nil {
+		t.Fatalf("deny non-owner prompt: %v", err)
+	}
+	afterDenied, _ := fixture.store.Configs().Load(context.Background(), key)
+	if afterDenied.Version != snapshot.Version || afterDenied.PromptOverride.Text != "speak concisely" {
+		t.Fatalf("non-owner changed config: %#v", afterDenied)
+	}
+	if got := fixture.sender.last().Text; got != "The /prompt command can only be used by group admins or the owner." {
+		t.Fatalf("denial response = %q", got)
+	}
+
+	clear := fixture.candidate("prompt-4", chat, conversation.ChatDirect, "/prompt clear")
+	clear.Owner = true
+	if err := fixture.handler.Handle(context.Background(), clear); err != nil {
+		t.Fatalf("clear prompt: %v", err)
+	}
+	cleared, _ := fixture.store.Configs().Load(context.Background(), key)
+	if cleared.PromptOverride != nil || cleared.Prompt != "base prompt" || cleared.Version != 3 {
+		t.Fatalf("clear changed wrong config fields: %#v", cleared)
+	}
+	if fixture.model.calls.Load() != 0 {
+		t.Fatalf("prompt commands called model %d times", fixture.model.calls.Load())
+	}
+}
+
+func TestUnknownSendOutcomeIsNotAutomaticallySentAgain(t *testing.T) {
+	fixture := newFixture(t)
+	fixture.sender.err = agent.NewError(agent.ErrorTimeout, "fake send", context.DeadlineExceeded)
+	candidate := fixture.candidate("unknown-1", "15550000004@s.whatsapp.net", conversation.ChatDirect, "hello")
+	err := fixture.handler.Handle(context.Background(), candidate)
+	if !agent.IsCode(err, agent.ErrorUnknownOutcome) {
+		t.Fatalf("first send error = %v, want unknown_outcome", err)
+	}
+	if err := fixture.handler.Handle(context.Background(), candidate); err != nil {
+		// The completed unknown inbound is intentionally ignored on provider
+		// duplicate rather than risking a second effect.
+		t.Fatalf("duplicate unknown outcome: %v", err)
+	}
+	if fixture.model.calls.Load() != 1 || fixture.sender.count() != 1 {
+		t.Fatalf("unknown replay model/sender calls = %d/%d, want 1/1", fixture.model.calls.Load(), fixture.sender.count())
+	}
+	claimed, claimErr := fixture.store.Inbound().ClaimAndResolveSender(context.Background(), candidate)
+	if claimErr != nil {
+		t.Fatalf("load unknown message: %v", claimErr)
+	}
+	if resumeErr := fixture.handler.Resume(context.Background(), claimed.Message); !agent.IsCode(resumeErr, agent.ErrorUnknownOutcome) {
+		t.Fatalf("explicit unknown replay error = %v, want unknown_outcome", resumeErr)
+	}
+	if fixture.sender.count() != 1 {
+		t.Fatalf("explicit unknown replay resent %d times", fixture.sender.count())
+	}
+}
+
+func TestPromptMutationRecoversCrashAfterConfigCommitWithoutApplyingTwice(t *testing.T) {
+	fixture := newFixture(t)
+	candidate := fixture.candidate("prompt-crash", "15550000005@s.whatsapp.net", conversation.ChatDirect, "/prompt set crash-safe")
+	candidate.Owner = true
+	claimed, err := fixture.store.Inbound().ClaimAndResolveSender(context.Background(), candidate)
+	if err != nil {
+		t.Fatalf("claim command: %v", err)
+	}
+	key := agent.Key{TenantID: claimed.Message.TenantID, AccountID: claimed.Message.AccountID, ChatID: claimed.Message.ChatID}
+	current, err := fixture.registry.AgentFor(context.Background(), key)
+	if err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+	snapshot, err := current.Config().Refresh(context.Background())
+	if err != nil {
+		t.Fatalf("refresh config: %v", err)
+	}
+	if _, err := current.Config().SetPromptOverride(context.Background(), snapshot.Version, agent.PromptOverride{Mode: agent.PromptAppend, Text: "crash-safe"}); err != nil {
+		t.Fatalf("commit config before simulated crash: %v", err)
+	}
+	// Simulate a crash after the config write but before the command was marked
+	// handled by invoking the duplicate durable inbox record through the handler.
+	if err := fixture.handler.Handle(context.Background(), candidate); err != nil {
+		t.Fatalf("recover duplicate command: %v", err)
+	}
+	recovered, err := fixture.store.Configs().Load(context.Background(), key)
+	if err != nil {
+		t.Fatalf("load recovered config: %v", err)
+	}
+	if recovered.Version != 2 || recovered.PromptOverride == nil || recovered.PromptOverride.Text != "crash-safe" {
+		t.Fatalf("command was applied twice or lost: %#v", recovered)
+	}
+	if fixture.sender.count() != 1 || fixture.model.calls.Load() != 0 {
+		t.Fatalf("recovery sender/model calls = %d/%d", fixture.sender.count(), fixture.model.calls.Load())
+	}
+}
+
+func TestPermissionCommandDurablyControlsModerationWithoutChangingDefaultReaction(t *testing.T) {
+	fixture := newFixture(t)
+	chat := "15550000019@s.whatsapp.net"
+	command := fixture.candidate("permission-1", chat, conversation.ChatDirect, "/permission 3")
+	command.Owner = true
+	if err := fixture.handler.Handle(context.Background(), command); err != nil {
+		t.Fatalf("set moderation level: %v", err)
+	}
+	claimed, err := fixture.store.Inbound().ClaimAndResolveSender(context.Background(), command)
+	if err != nil {
+		t.Fatalf("claim permission command: %v", err)
+	}
+	key := agent.Key{TenantID: claimed.Message.TenantID, AccountID: claimed.Message.AccountID, ChatID: claimed.Message.ChatID}
+	snapshot, err := fixture.store.Configs().Load(context.Background(), key)
+	if err != nil || snapshot.Permission.ModerationLevel != agent.ModerationDeleteMuteKick ||
+		!snapshot.Permission.ModelToolCapabilities().Has("message.react") {
+		t.Fatalf("stored permission = %#v, %v", snapshot.Permission, err)
+	}
+	if fixture.model.calls.Load() != 0 {
+		t.Fatalf("permission command called model %d times", fixture.model.calls.Load())
+	}
+	message := fixture.candidate("permission-2", chat, conversation.ChatDirect, "what can you do?")
+	if err := fixture.handler.Handle(context.Background(), message); err != nil {
+		t.Fatalf("invoke after model capability grant: %v", err)
+	}
+	request := fixture.model.lastRequest()
+	// A direct-chat requester cannot invoke group management even when the
+	// chat's stored moderation setting enables it for eligible group admins.
+	if !request.Capabilities.Has("message.react") || request.Capabilities.Has("group.delete") ||
+		request.Capabilities.Has("group.mute") || request.Capabilities.Has("group.kick") {
+		t.Fatalf("model invocation capabilities = %#v", request.Capabilities.Values())
+	}
+	// The bot may run the settings, memory, sticker, task and download commands;
+	// the prompt says for whom. /catch, /help and /info are for people only.
+	if !slices.Equal(request.Commands, []string{"add-sticker", "daily-task", "download", "memory", "permission", "prompt", "remove-sticker", "schedule-task", "sticker"}) {
+		t.Fatalf("model command grants = %#v / %#v", request.Capabilities.Values(), request.Commands)
+	}
+
+	denied := fixture.candidate("permission-3", chat, conversation.ChatDirect, "/permission 0")
+	if err := fixture.handler.Handle(context.Background(), denied); err != nil {
+		t.Fatalf("deny non-owner permission: %v", err)
+	}
+	afterDenied, err := fixture.store.Configs().Load(context.Background(), key)
+	if err != nil || afterDenied.Permission.ModerationLevel != agent.ModerationDeleteMuteKick {
+		t.Fatalf("non-owner changed moderation level: %#v, %v", afterDenied.Permission, err)
+	}
+	if got := fixture.sender.last().Text; got != "The /permission command can only be used by group admins or the owner." {
+		t.Fatalf("permission denial response = %q", got)
+	}
+}
+
+func TestPermissionCommandRecoveryDoesNotApplyTwice(t *testing.T) {
+	fixture := newFixture(t)
+	candidate := fixture.candidate("permission-crash", "15550000020@s.whatsapp.net", conversation.ChatDirect, "/permission 2")
+	candidate.Owner = true
+	claimed, err := fixture.store.Inbound().ClaimAndResolveSender(context.Background(), candidate)
+	if err != nil {
+		t.Fatalf("claim command: %v", err)
+	}
+	key := agent.Key{TenantID: claimed.Message.TenantID, AccountID: claimed.Message.AccountID, ChatID: claimed.Message.ChatID}
+	current, err := fixture.registry.AgentFor(context.Background(), key)
+	if err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+	snapshot, err := current.Config().Refresh(context.Background())
+	if err != nil {
+		t.Fatalf("refresh config: %v", err)
+	}
+	permission := snapshot.Permission
+	permission.ModerationLevel = agent.ModerationDeleteMute
+	if _, err := current.Config().SetPermission(context.Background(), snapshot.Version, permission); err != nil {
+		t.Fatalf("commit config before simulated crash: %v", err)
+	}
+	if err := fixture.handler.Handle(context.Background(), candidate); err != nil {
+		t.Fatalf("recover duplicate command: %v", err)
+	}
+	recovered, err := fixture.store.Configs().Load(context.Background(), key)
+	if err != nil || recovered.Version != 2 || recovered.Permission.ModerationLevel != agent.ModerationDeleteMute {
+		t.Fatalf("permission command was applied twice or lost: %#v, %v", recovered, err)
+	}
+}
+
+func TestDurablyClaimedInboundCanResumeWithoutProviderReplay(t *testing.T) {
+	fixture := newFixture(t)
+	candidate := fixture.candidate("inbound-crash", "15550000006@s.whatsapp.net", conversation.ChatDirect, "resume me")
+	candidate.ReceivedAt = time.Now().UTC().Add(-time.Minute)
+	candidate.OccurredAt = candidate.ReceivedAt.Add(-time.Second)
+	claimed, err := fixture.store.Inbound().ClaimAndResolveSender(context.Background(), candidate)
+	if err != nil {
+		t.Fatalf("claim before crash: %v", err)
+	}
+	messages, err := fixture.store.Inbound().ListUnfinished(context.Background(), fixture.tenantID, nil, 0)
+	if err != nil {
+		t.Fatalf("list unfinished inbound: %v", err)
+	}
+	if len(messages) != 1 || messages[0].InvocationID != claimed.Message.InvocationID {
+		t.Fatalf("unfinished messages = %#v", messages)
+	}
+	if err := fixture.handler.Recover(context.Background(), fixture.tenantID); err != nil {
+		t.Fatalf("recover durable inbound: %v", err)
+	}
+	if fixture.model.calls.Load() != 1 || fixture.sender.count() != 1 {
+		t.Fatalf("resumed model/sender calls = %d/%d", fixture.model.calls.Load(), fixture.sender.count())
+	}
+}
+
+func TestDispatcherRechecksCurrentAllowlistBeforeEverySend(t *testing.T) {
+	fixture := newFixture(t)
+	chat := "15550000008@s.whatsapp.net"
+	original := fixture.candidate("policy-send-1", chat, conversation.ChatDirect, "plan while disconnected")
+	claimed, err := fixture.store.Inbound().ClaimAndResolveSender(context.Background(), original)
+	if err != nil {
+		t.Fatalf("claim original: %v", err)
+	}
+	key := agent.Key{TenantID: claimed.Message.TenantID, AccountID: claimed.Message.AccountID, ChatID: claimed.Message.ChatID}
+	current, err := fixture.registry.AgentFor(context.Background(), key)
+	if err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+	snapshot, err := current.Config().Refresh(context.Background())
+	if err != nil {
+		t.Fatalf("refresh config: %v", err)
+	}
+	capabilities, _ := agent.NewCapabilitySet()
+	invocation := agent.Invocation{
+		ID: claimed.Message.InvocationID, Causation: agent.CausationRef{Kind: agent.CausationMessage, ID: claimed.Message.CausationID},
+		Cause:  agent.CauseInboundMessage,
+		Sender: &agent.SenderContext{ParticipantID: claimed.Message.SenderID, Ref: claimed.Message.SenderRef, DisplayName: claimed.Message.SenderName},
+		Input:  []agent.ContentPart{agent.TextPart{Text: claimed.Message.Text}}, Capabilities: capabilities,
+		PolicyVersion: snapshot.Version, RequestedAt: claimed.Message.OccurredAt,
+	}
+	if _, err := fixture.store.Turns().Claim(context.Background(), agent.ClaimTurnRequest{Key: key, Invocation: invocation, Now: time.Now().UTC()}); err != nil {
+		t.Fatalf("claim planned turn: %v", err)
+	}
+	plan, err := fixture.store.Turns().CommitPlan(context.Background(), agent.CommitPlanRequest{
+		Key: key, InvocationID: invocation.ID, ConfigVersion: snapshot.Version, ResponseText: "pending response",
+	})
+	if err != nil {
+		t.Fatalf("commit pending plan: %v", err)
+	}
+	removed := fixture.candidate("policy-send-2", chat, conversation.ChatDirect, "no longer allowed")
+	removed.Allowlisted = false
+	if err := fixture.handler.Handle(context.Background(), removed); err != nil {
+		t.Fatalf("record removed allowlist state: %v", err)
+	}
+	_, err = fixture.dispatcher.Dispatch(context.Background(), plan.Dispatch)
+	if !agent.IsCode(err, agent.ErrorPermissionDenied) {
+		t.Fatalf("send after allowlist removal error = %v, want permission_denied", err)
+	}
+	if fixture.sender.count() != 0 {
+		t.Fatalf("policy-denied action reached native sender %d times", fixture.sender.count())
+	}
+}
+
+type fixture struct {
+	tenantID   identity.TenantID
+	accountID  identity.AccountID
+	store      *appsqlite.Store
+	registry   *agent.Registry
+	handler    *directIngress
+	model      *echoModel
+	sender     *recordingSender
+	dispatcher *action.Dispatcher
+	gate       *policy.FixedGate
+	responder  *action.CommandResponder
+	// stop ends the inbound dispatcher, as a shutdown would.
+	stop func()
+}
+
+// directIngress makes the dispatcher synchronous for tests: each call waits
+// until every chat is idle and returns what the background turns reported.
+type directIngress struct {
+	dispatcher *inbound.Dispatcher
+	mu         sync.Mutex
+	reported   []error
+}
+
+func (handler *directIngress) report(err error) {
+	handler.mu.Lock()
+	handler.reported = append(handler.reported, err)
+	handler.mu.Unlock()
+}
+
+func (handler *directIngress) settle(err error) error {
+	handler.dispatcher.WaitIdle()
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	if err == nil && len(handler.reported) > 0 {
+		err = handler.reported[0]
+	}
+	handler.reported = nil
+	return err
+}
+
+func (handler *directIngress) Handle(ctx context.Context, candidate conversation.IncomingCandidate) error {
+	return handler.settle(handler.dispatcher.Handle(ctx, candidate))
+}
+
+func (handler *directIngress) Resume(ctx context.Context, message conversation.IncomingMessage) error {
+	return handler.settle(handler.dispatcher.Resume(ctx, message))
+}
+
+func (handler *directIngress) Recover(ctx context.Context, tenantID identity.TenantID) error {
+	return handler.settle(handler.dispatcher.Recover(ctx, tenantID))
+}
+
+type failingText struct {
+	code  agent.ErrorCode
+	calls atomic.Int32
+}
+
+func (sender *failingText) SendText(context.Context, action.SendTextRequest) (action.SendTextResult, error) {
+	sender.calls.Add(1)
+	return action.SendTextResult{}, agent.NewError(sender.code, "send WhatsApp text", errors.New("send failed"))
+}
+
+func TestFailedCommandIsClosedAndNotRetried(t *testing.T) {
+	for _, test := range []struct {
+		code  agent.ErrorCode
+		reply string // empty: the failed send may have been delivered, so no apology
+	}{
+		{code: agent.ErrorProviderFailure},
+		{code: agent.ErrorTimeout},
+		{code: agent.ErrorUnavailable, reply: "Sorry, /help failed"},
+		{code: agent.ErrorNotReady, reply: "still starting up"},
+	} {
+		t.Run(string(test.code), func(t *testing.T) {
+			fixture := newFixture(t)
+			failing := &failingText{code: test.code}
+			dispatcher, err := inbound.NewDispatcher(
+				fixture.store.Inbound(), fixture.registry, fixture.gate, fixture.responder, inbound.DiscardObserver{},
+				command.Platform{Text: failing}, inbound.Options{BurstCap: 1, Report: fixture.handler.report},
+			)
+			if err != nil {
+				t.Fatalf("create inbound dispatcher: %v", err)
+			}
+			fixture.handler.dispatcher = dispatcher
+			candidate := fixture.candidate("failing-help", "15550000007@s.whatsapp.net", conversation.ChatDirect, "/help")
+			candidate.ReceivedAt = time.Now().UTC().Add(-time.Minute)
+			candidate.OccurredAt = candidate.ReceivedAt.Add(-time.Second)
+			if err := fixture.handler.Handle(context.Background(), candidate); !agent.IsCode(err, test.code) {
+				t.Fatalf("handle failing command error = %v, want %s", err, test.code)
+			}
+			wantReplies := 0
+			if test.reply != "" {
+				wantReplies = 1
+			}
+			if failing.calls.Load() != 1 || fixture.sender.count() != wantReplies {
+				t.Fatalf("command sends=%d failure replies=%d, want 1/%d", failing.calls.Load(), fixture.sender.count(), wantReplies)
+			}
+			if test.reply != "" && !strings.Contains(fixture.sender.last().Text, test.reply) {
+				t.Fatalf("failure reply = %q, want it to contain %q", fixture.sender.last().Text, test.reply)
+			}
+			messages, err := fixture.store.Inbound().ListUnfinished(context.Background(), fixture.tenantID, nil, 0)
+			if err != nil {
+				t.Fatalf("list unfinished inbound: %v", err)
+			}
+			if len(messages) != 0 {
+				t.Fatalf("failed command is still unfinished: %#v", messages)
+			}
+			if err := fixture.handler.Handle(context.Background(), candidate); err != nil {
+				t.Fatalf("redelivered failed command: %v", err)
+			}
+			if failing.calls.Load() != 1 || fixture.sender.count() != wantReplies {
+				t.Fatalf("redelivery re-ran the command: sends=%d replies=%d", failing.calls.Load(), fixture.sender.count())
+			}
+		})
+	}
+}
+
+func newFixture(t *testing.T) *fixture {
+	return newFixtureWithBatching(t, 0, 1)
+}
+
+func newFixtureWithBatching(t *testing.T, debounce time.Duration, burstCap uint32) *fixture {
+	t.Helper()
+	tenantID, _ := identity.NewTenantID()
+	accountID, _ := identity.NewAccountID()
+	return newFixtureAtPath(t, filepath.Join(t.TempDir(), "app.db"), tenantID, accountID, debounce, burstCap)
+}
+
+func newFixtureAtPath(
+	t *testing.T,
+	path string,
+	tenantID identity.TenantID,
+	accountID identity.AccountID,
+	debounce time.Duration,
+	burstCap uint32,
+	tune ...func(*inbound.Options, *agent.ConfigValues),
+) *fixture {
+	t.Helper()
+	providerID, _ := identity.ParseProviderID("openai-compatible")
+	policyID, _ := identity.ParsePolicyID("part1-chat-gate.v1")
+	store, err := appsqlite.Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	model := &echoModel{}
+	sender := &recordingSender{}
+	sender.ready.Store(true)
+	chats := store.Inbound()
+	gate, err := policy.NewFixedGate(policyID, 1, store.Configs(), chats, staticChatAuthority{chats: chats}, "Vivy", true)
+	if err != nil {
+		t.Fatalf("create policy: %v", err)
+	}
+	dispatcher, err := action.NewDispatcher(store.Actions(), gate, sender, agent.SystemClock{}, action.DiscardObserver{})
+	if err != nil {
+		t.Fatalf("create dispatcher: %v", err)
+	}
+	defaults := agent.ConfigValues{
+		Model:      agent.ModelConfig{ProviderID: providerID, Model: "fake-model", MaxOutputTokens: 256},
+		Prompt:     "base prompt",
+		Permission: agent.PermissionConfig{PolicyID: policyID, Revision: 1},
+		Triggers:   agent.DefaultTriggerConfig(),
+	}
+	dispatcherOptions := inbound.Options{Debounce: debounce, BurstCap: burstCap, Stickers: store.Stickers()}
+	for _, apply := range tune {
+		apply(&dispatcherOptions, &defaults)
+	}
+	contextBuilder, _ := agent.NewDeterministicContextBuilder(agent.DefaultMaxContextBytes, "Vivy")
+	factory := agent.FactoryFunc(func(ctx context.Context, key agent.Key) (*agent.Agent, error) {
+		return agent.New(ctx, key, agent.Dependencies{
+			Defaults: defaults, ConfigStore: store.Configs(), HistoryStore: store.History(), Turns: store.Turns(),
+			Context: contextBuilder, ChatContext: staticChatContextReader{}, HistoryWindow: agent.DefaultHistoryWindow, Model: model,
+			Responses: dispatcher, Clock: agent.SystemClock{},
+		})
+	})
+	registry, err := agent.NewRegistry(factory)
+	if err != nil {
+		t.Fatalf("create registry: %v", err)
+	}
+	responder, err := action.NewCommandResponder(store.Actions(), dispatcher)
+	if err != nil {
+		t.Fatalf("create command responder: %v", err)
+	}
+	ingress := &directIngress{}
+	dispatcherOptions.Report = ingress.report
+	ingress.dispatcher, err = inbound.NewDispatcher(
+		store.Inbound(), registry, gate, responder, inbound.DiscardObserver{}, command.Platform{Text: sender}, dispatcherOptions,
+	)
+	if err != nil {
+		t.Fatalf("create inbound dispatcher: %v", err)
+	}
+	runCtx, stop := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	running := ingress.dispatcher
+	go func() { _ = running.Run(runCtx); close(stopped) }()
+	var stopOnce sync.Once
+	stopDispatcher := func() { stopOnce.Do(func() { stop(); <-stopped }) }
+	fixture := &fixture{
+		tenantID: tenantID, accountID: accountID, store: store, registry: registry,
+		handler: ingress, model: model, sender: sender, dispatcher: dispatcher, gate: gate, responder: responder,
+		stop: stopDispatcher,
+	}
+	t.Cleanup(func() {
+		stopDispatcher()
+		_ = store.Close()
+	})
+	return fixture
+}
+
+func (fixture *fixture) candidate(id, chat string, kind conversation.ChatKind, text string) conversation.IncomingCandidate {
+	now := time.Now().UTC()
+	lid, _ := identity.ParseLID("10000000001@lid")
+	return conversation.IncomingCandidate{
+		TenantID: fixture.tenantID, AccountID: fixture.accountID,
+		ProviderMessageID: id, ProviderChatAddress: chat, SenderLID: lid, ProviderSenderPhone: "15550000001@s.whatsapp.net",
+		SenderName: "Tester", ChatKind: kind, Text: text, Allowlisted: true,
+		OccurredAt: now.Add(-time.Second), ReceivedAt: now,
+	}
+}
+
+type echoModel struct {
+	calls atomic.Int32
+	mu    sync.Mutex
+	seen  []agent.ModelRequest
+}
+
+func (model *echoModel) Generate(_ context.Context, request agent.ModelRequest) (agent.ModelResult, error) {
+	model.calls.Add(1)
+	request.Messages = append([]agent.ModelMessage(nil), request.Messages...)
+	model.mu.Lock()
+	model.seen = append(model.seen, request)
+	model.mu.Unlock()
+	if len(request.Messages) == 0 {
+		return agent.ModelResult{}, fmt.Errorf("missing model messages")
+	}
+	content := request.Messages[len(request.Messages)-1].Content
+	content = strings.TrimPrefix(content, "<untrusted_chat_history>\n")
+	content = strings.TrimSuffix(content, "\n</untrusted_chat_history>")
+	lastLine := content
+	if index := strings.LastIndexByte(content, '\n'); index >= 0 {
+		lastLine = content[index+1:]
+	}
+	_, text, ok := strings.Cut(lastLine, ": ")
+	if !ok {
+		return agent.ModelResult{}, fmt.Errorf("invalid compact user transcript")
+	}
+	return agent.ModelResult{Text: "reply: " + text}, nil
+}
+
+func (model *echoModel) lastRequest() agent.ModelRequest {
+	model.mu.Lock()
+	defer model.mu.Unlock()
+	if len(model.seen) == 0 {
+		return agent.ModelRequest{}
+	}
+	return model.seen[len(model.seen)-1]
+}
+
+type recordingSender struct {
+	mu       sync.Mutex
+	requests []action.SendTextRequest
+	err      error
+	ready    atomic.Bool
+}
+
+type staticChatAuthority struct {
+	chats policy.HumanAccessReader
+}
+
+type staticChatContextReader struct{}
+
+func (staticChatContextReader) ReadChatContext(context.Context, agent.Key) (agent.ChatContext, error) {
+	return agent.ChatContext{Kind: "private"}, nil
+}
+
+func (authority staticChatAuthority) ReadChatAuthority(ctx context.Context, principal policy.Principal) (policy.ChatAuthority, error) {
+	if principal.Kind == policy.PrincipalModel {
+		return policy.ChatAuthority{ChatKind: conversation.ChatDirect, ObservedAt: time.Now().UTC().UnixMilli()}, nil
+	}
+	access, err := authority.chats.ReadHumanAccess(ctx, principal)
+	if err != nil {
+		return policy.ChatAuthority{}, err
+	}
+	return policy.ChatAuthority{ChatKind: access.ChatKind, ObservedAt: time.Now().UTC().UnixMilli()}, nil
+}
+
+func (sender *recordingSender) Ready() bool { return sender.ready.Load() }
+
+func (sender *recordingSender) SendCopyCode(context.Context, action.SendCopyCodeRequest) error {
+	return nil
+}
+
+func (sender *recordingSender) SendText(_ context.Context, request action.SendTextRequest) (action.SendTextResult, error) {
+	sender.mu.Lock()
+	sender.requests = append(sender.requests, request)
+	err := sender.err
+	sender.mu.Unlock()
+	if err != nil {
+		return action.SendTextResult{}, err
+	}
+	return action.SendTextResult{ProviderReceipt: "provider-" + request.ActionID.String()}, nil
+}
+
+func (sender *recordingSender) count() int {
+	sender.mu.Lock()
+	defer sender.mu.Unlock()
+	return len(sender.requests)
+}
+
+func (sender *recordingSender) last() action.SendTextRequest {
+	sender.mu.Lock()
+	defer sender.mu.Unlock()
+	return sender.requests[len(sender.requests)-1]
+}
+
+type smartJudge struct {
+	mu      sync.Mutex
+	respond bool
+	err     error
+	judged  []string
+}
+
+func (judge *smartJudge) ShouldRespond(_ context.Context, message conversation.IncomingMessage, _ agent.ConfigSnapshot) (bool, error) {
+	judge.mu.Lock()
+	defer judge.mu.Unlock()
+	judge.judged = append(judge.judged, conversation.AuthoredText(message.Text))
+	return judge.respond, judge.err
+}
+
+func (judge *smartJudge) texts() []string {
+	judge.mu.Lock()
+	defer judge.mu.Unlock()
+	return append([]string(nil), judge.judged...)
+}
+
+func TestSmartTriggerDebounceJudgesOnlyTheNewestOfABurst(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		judge   *smartJudge
+		answers int32
+	}{
+		{name: "worth a response", judge: &smartJudge{respond: true}, answers: 1},
+		{name: "judge failed", judge: &smartJudge{respond: true, err: context.DeadlineExceeded}, answers: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tenantID, _ := identity.NewTenantID()
+			accountID, _ := identity.NewAccountID()
+			fixture := newFixtureAtPath(t, filepath.Join(t.TempDir(), "app.db"), tenantID, accountID, 0, 8,
+				func(options *inbound.Options, defaults *agent.ConfigValues) {
+					options.SmartDebounce = 200 * time.Millisecond
+					defaults.Triggers.Smart = true
+				})
+			fixture.gate.SetResponseJudge(test.judge)
+			chat := "120363000000000077@g.us"
+			for index, text := range []string{"first", "second", "third"} {
+				candidate := fixture.candidate(fmt.Sprintf("smart-%d", index), chat, conversation.ChatGroup, text)
+				// Straight to the dispatcher: the test ingress would wait out the
+				// debounce after every message.
+				if err := fixture.handler.dispatcher.Handle(context.Background(), candidate); err != nil {
+					t.Fatalf("handle %q: %v", text, err)
+				}
+			}
+			if err := fixture.handler.settle(nil); err != nil {
+				t.Fatalf("settle burst: %v", err)
+			}
+			if judged := test.judge.texts(); len(judged) != 1 || judged[0] != "third" {
+				t.Fatalf("judged = %q, want only the newest message", judged)
+			}
+			if fixture.model.calls.Load() != test.answers || fixture.sender.count() != int(test.answers) {
+				t.Fatalf("model/sender calls = %d/%d, want %d", fixture.model.calls.Load(), fixture.sender.count(), test.answers)
+			}
+			unfinished, err := fixture.store.Inbound().ListUnfinished(context.Background(), fixture.tenantID, nil, 0)
+			if err != nil || len(unfinished) != 0 {
+				t.Fatalf("burst left unfinished messages: %d, err=%v", len(unfinished), err)
+			}
+			if err := fixture.handler.Recover(context.Background(), fixture.tenantID); err != nil {
+				t.Fatalf("recover: %v", err)
+			}
+			if len(test.judge.texts()) != 1 {
+				t.Fatalf("recovery judged the burst again: %q", test.judge.texts())
+			}
+		})
+	}
+}
