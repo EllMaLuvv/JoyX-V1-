@@ -1,6 +1,6 @@
 # JoyX v1
 
-Bot WhatsApp self-hosted dengan asisten AI. Dibangun di atas [WazzapAgent-Go](https://github.com/Chomosuke9/WazzapAgent-Go): satu akun WhatsApp tertaut, balasan AI di grup dan chat pribadi, unduhan video otomatis, pembuat stiker, dan halaman lokal untuk memasang akun sekaligus membaca riwayat pesan.
+Bot WhatsApp self-hosted dengan asisten AI.Satu akun WhatsApp tertaut, balasan AI di grup dan chat pribadi, unduhan video otomatis, pembuat stiker, dan local website untuk memasang akun sekaligus membaca riwayat pesan JoyX.
 
 ## Fitur
 
@@ -10,7 +10,7 @@ Bot WhatsApp self-hosted dengan asisten AI. Dibangun di atas [WazzapAgent-Go](ht
 - Prompt sistem per chat (`/prompt`), level moderasi (`/permission`), dan ingatan jangka panjang (`/memory`).
 
 **Unduh video otomatis**
-- Tempel link TikTok, Instagram, Facebook atau X → video langsung diunduh dan dikirim, tanpa perintah.
+- Tempel link TikTok, Instagram, Facebook atau X → video langsung diunduh dan dikirim, tanpa prefix.
 - Atau ketik `/download <link>` (alias `/tt`, `/ig`, `/fb`, `/dl`).
 - Resolusi terbaik dari sumber, sampai batas 1080p60; caption menyebut resolusi asli yang didapat.
 - Story dan highlight Instagram (`instagram.com/stories/...`) didukung; story yang isinya foto dikirim sebagai gambar.
@@ -19,12 +19,10 @@ Bot WhatsApp self-hosted dengan asisten AI. Dibangun di atas [WazzapAgent-Go](ht
 **Stiker**
 - `.s` / `/sticker` mengubah gambar, GIF atau video (yang dikirim atau di-quote) menjadi stiker WhatsApp.
 - Teks meme opsional: `/sticker teks atas#teks bawah`.
-- Semua stiker buatan Joy membawa watermark `JOYX` di sudutnya.
 - Simpan stiker bernama dengan `/add-sticker <nama>`, kirim ulang lewat katalog chat.
 
 **Local Host** — http://127.0.0.1:3001
 - QR pairing, status bot, dan panel "Riwayat Joy" berisi pesan yang dikirim Joy dalam 7 hari terakhir.
-- Logo dan latar halaman bisa diganti lewat `web/logo.jpg` dan `web/background.jpg`.
 
 **Perintah lain yang tersedia**
 - `/img` — kirim balik stiker/gambar sebagai gambar. `/rvo` (owner) — buka kembali view-once.
