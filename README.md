@@ -22,7 +22,7 @@ Bot WhatsApp self-hosted dengan asisten AI. Dibangun di atas [WazzapAgent-Go](ht
 - Semua stiker buatan Joy membawa watermark `JOYX` di sudutnya.
 - Simpan stiker bernama dengan `/add-sticker <nama>`, kirim ulang lewat katalog chat.
 
-**Halaman lokal** — http://127.0.0.1:3001
+**Local Host** — http://127.0.0.1:3001
 - QR pairing, status bot, dan panel "Riwayat Joy" berisi pesan yang dikirim Joy dalam 7 hari terakhir.
 - Logo dan latar halaman bisa diganti lewat `web/logo.jpg` dan `web/background.jpg`.
 
@@ -40,7 +40,7 @@ Bot WhatsApp self-hosted dengan asisten AI. Dibangun di atas [WazzapAgent-Go](ht
 - `yt-dlp` dan `ffmpeg` untuk unduhan video. Di Windows `curl_cffi` wajib terpasang pada interpreter Python yang dipakai yt-dlp — tanpa itu TikTok menolak request.
 - Browser untuk membuka halaman lokal saat memasang akun.
 
-## Menjalankan
+## RUN
 
 ```sh
 go build -o bin/joyx.exe ./cmd/wazzapagent
@@ -53,7 +53,7 @@ Windows: jalankan `run-joyx.bat` (build otomatis kalau binary belum ada). Buka h
 
 Selengkapnya di `.env.example`. Yang paling penting:
 
-| Variabel | Fungsi |
+| Variabel | Function |
 | --- | --- |
 | `WAZZAP_LLM_ENDPOINT`, `WAZZAP_LLM_API_KEY`, `WAZZAP_LLM_MODEL` | Penyedia model (contoh: Groq + `openai/gpt-oss-120b`) |
 | `WAZZAP_OWNER` | JID/nomor pemilik |
@@ -62,7 +62,7 @@ Selengkapnya di `.env.example`. Yang paling penting:
 | `WAZZAP_DOWNLOAD_MAX_MB` | Batas ukuran unduhan |
 | `WAZZAP_PAIRING_WEB` | Alamat halaman lokal, `off` untuk mematikan |
 
-## Struktur
+## Struct
 
 - `internal/inbound/commands/` — satu perintah satu file (`download.go`, `sticker.go`, `memory.go`, …).
 - `internal/downloader/` — pemilihan format, penggabungan audio, dan batas ukuran.
